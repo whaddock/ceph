@@ -1,0 +1,5 @@
+#!/bin/bash
+#Configure Ceph with Gibraltar. We do not need to build radosgw nor cephfs.
+#We do need rados and radosstriper along with osd and mon.
+
+./configure --without-radosgw --without-cephfs --with-radosstriper --with-rados --with-osd --with-mon  

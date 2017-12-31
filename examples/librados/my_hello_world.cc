@@ -16,16 +16,19 @@
 #include <string>
 #include <sstream>
 #include <ctime>
+#include <stdio.h>
 
 #define DEBUG 0
-#define ITERATIONS 120
+#define ITERATIONS 120*10
+#define START_ITERATIONS 120*10*3 
 #define BUFFER_SIZE 4194304*2
-#define START_TIMER std::clock_t begin_time = std::clock();
-#define FINISH_TIMER std::clock_t end_time = std::clock(); \
-  std::clock_t total_time_ms = (end_time - begin_time) / (double)(CLOCKS_PER_SEC / 1000);
-#define REPORT_BENCHMARK std::cout << total_time_ms  << " ms\t" << (ITERATIONS * BUFFER_SIZE) / (1024*1024) << " MB\t" \
-	       << (ITERATIONS * BUFFER_SIZE) / (double)(1024*total_time_ms) << " MB/s" << std::endl;
-
+#define START_TIMER begin_time = std::clock();
+#define FINISH_TIMER end_time = std::clock(); \
+               total_time_ms = (end_time - begin_time) / (double)(CLOCKS_PER_SEC / 1000);
+#define REPORT_TIMING std::cout << total_time_ms  << " ms\t" << std::endl;
+#define REPORT_BENCHMARK std::cout << total_time_ms  << " ms\t" << ((double)ITERATIONS * (double)BUFFER_SIZE) / (1024*1024) << " MB\t" \
+  << ((double)ITERATIONS * (double)BUFFER_SIZE) / (double)(1024*total_time_ms) << " MB/s" << std::endl; \
+  total_run_time_ms += total_time_ms;
 
 int main(int argc, const char **argv)
 {
@@ -36,6 +39,15 @@ int main(int argc, const char **argv)
   std::string hello("hello world!");
   std::string object_name("hello_object");
   librados::IoCtx io_ctx;
+
+  // variables used for timing
+  std::clock_t end_time;
+  std::clock_t begin_time;
+  std::clock_t total_time_ms = 0;
+  std::clock_t total_run_time_ms = 0;
+
+  START_TIMER; // Code for the begin_time
+  std::cout << "pool_name = " << pool_name << std::endl;
 
   // first, we create a Rados object and initialize it
   librados::Rados rados;
@@ -165,7 +177,7 @@ int main(int argc, const char **argv)
    */
   {
     librados::bufferlist read_buf;
-    int read_len = BUFFER_SIZE; // this is way more than we need
+    long read_len = BUFFER_SIZE; // this is way more than we need
     // allocate the completion from librados
     librados::AioCompletion *read_completion = librados::Rados::aio_create_completion();
     // send off the request.
@@ -288,25 +300,33 @@ int main(int argc, const char **argv)
 	        << std::endl;
     }
   }
+  FINISH_TIMER; // Compute total time since START_TIMER
+  std::cout << "Preliminary tests total time." << std::endl;
+  REPORT_TIMING; // Print out the benchmark for this test
 
   {
     /* Here we write 4 buffers from a map<int,bufferlist>
      * like we would do in the erasure code benchmark. Then we
      * will read them back in using the async read.
      */
+    START_TIMER; // Code for the begin_time
     librados::bufferlist bl;
     bl.append(std::string(BUFFER_SIZE,'X'));
-    std::map<int,bufferlist> encoded;
-    for (int i=0;i<ITERATIONS;i++) {
-      encoded.insert( std::pair<int,bufferlist>(i,bl));
+    std::map<long,bufferlist> encoded;
+    for (long i=START_ITERATIONS;i<ITERATIONS+START_ITERATIONS;i++) {
+      encoded.insert( std::pair<long,bufferlist>(i,bl));
     }
 
     /*
      * now that we have the data to write, let's send it to an object.
      * We'll use the synchronous interface for simplicity.
      */
-    std::map<int,bufferlist>::iterator it = encoded.begin();
-     START_TIMER // Code for the begin_time
+    std::map<long,bufferlist>::iterator it = encoded.begin();
+    FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Setup for first write test." << std::endl;
+    REPORT_TIMING; // Print out the benchmark for this test
+
+    START_TIMER; // Code for the begin_time
     for (it=encoded.begin(); it!=encoded.end(); it++) {
       std::stringstream object_name;
       object_name  << "Obj-" << it->first;
@@ -324,6 +344,7 @@ int main(int argc, const char **argv)
       }
     }
     FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "First write test." << std::endl;
     REPORT_BENCHMARK; // Print out the benchmark for this test
   }
 
@@ -332,19 +353,24 @@ int main(int argc, const char **argv)
      * like we would do in the erasure code benchmark. Then we
      * will read them back in using the async read.
      */
+    START_TIMER; // Code for the begin_time
     librados::bufferlist bl;
     bl.append(std::string(BUFFER_SIZE,'X'));
-    std::map<int,bufferlist> encoded;
+    std::map<long,bufferlist> encoded;
     // this is the second set of objects
-    for (int i=ITERATIONS+1;i<2*ITERATIONS;i++) {
-      encoded.insert( std::pair<int,bufferlist>(i,bl));
+    for (long i=START_ITERATIONS+ITERATIONS+1;i<2*ITERATIONS+START_ITERATIONS;i++) {
+      encoded.insert( std::pair<long,bufferlist>(i,bl));
     }
 
     /*
      * now that we have the data to write, let's send it to an object.
      * We'll use the ObjectWriteOperation.
      */
-    std::map<int,bufferlist>::iterator it = encoded.begin();
+    std::map<long,bufferlist>::iterator it = encoded.begin();
+    FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Setup for second write test. Uses write operation." << std::endl;
+    REPORT_TIMING; // Print out the benchmark for this test
+
     START_TIMER // Code for the begin_time
     for (it=encoded.begin(); it!=encoded.end(); it++) {
       std::stringstream object_name;
@@ -365,6 +391,7 @@ int main(int argc, const char **argv)
       } 
     }
     FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Second write test." << std::endl;
     REPORT_BENCHMARK; // Print out the benchmark for this test
   }
 
@@ -374,18 +401,22 @@ int main(int argc, const char **argv)
    * wanted to send off multiple reads at once; see
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
+  START_TIMER; // Code for the begin_time
   {
-    librados::bufferlist bl;
-    bl.append(std::string(BUFFER_SIZE,'X'));
-    std::map<int,bufferlist> encoded;
-    for (int i=ITERATIONS+1;i<2*ITERATIONS;i++) {
-       encoded.insert( std::pair<int,bufferlist>(i,bl));
+    std::map<long,bufferlist> encoded;
+    for (long i=START_ITERATIONS+ITERATIONS+1;i<2*ITERATIONS+START_ITERATIONS;i++) {
+      librados::bufferlist bl;
+       encoded.insert( std::pair<long,bufferlist>(i,bl));
      }
 
-     int read_len = BUFFER_SIZE; // this is way more than we need
+     long read_len = BUFFER_SIZE; // this is way more than we need
      // allocate the completion from librados
-     std::map<int,bufferlist>::iterator it = encoded.begin();
-     START_TIMER // Code for the begin_time
+     std::map<long,bufferlist>::iterator it = encoded.begin();
+     FINISH_TIMER; // Compute total time since START_TIMER
+     std::cout << "Setup for first read test. Using AIO." << std::endl;
+     REPORT_TIMING; // Print out the benchmark for this test
+
+     START_TIMER; // Code for the begin_time
      for (it=encoded.begin(); it!=encoded.end(); it++) {
        std::stringstream object_name;
        object_name  << "Obj-" << it->first;
@@ -413,6 +444,7 @@ int main(int argc, const char **argv)
        }
      }
      FINISH_TIMER; // Compute total time since START_TIMER
+     std::cout << "Read test." << std::endl;
      REPORT_BENCHMARK; // Print out the benchmark for this test
    }
 
@@ -424,17 +456,22 @@ int main(int argc, const char **argv)
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
   {
-    std::map<int,bufferlist> encoded;
-    std::map<int,librados::AioCompletion*> write_completion;
-    for (int i=ITERATIONS+1;i<2*ITERATIONS;i++) {
+    START_TIMER; // Code for the begin_time
+    std::map<long,bufferlist> encoded;
+    std::map<long,librados::AioCompletion*> write_completion;
+    for (long i=START_ITERATIONS+2*ITERATIONS+1;i<3*ITERATIONS+START_ITERATIONS;i++) {
       librados::bufferlist bl;
       bl.append(std::string(BUFFER_SIZE,'X'));
-      encoded.insert( std::pair<int,bufferlist>(i,bl));
-      write_completion.insert( std::pair<int,librados::AioCompletion*>(i,librados::Rados::aio_create_completion()));
+      encoded.insert( std::pair<long,bufferlist>(i,bl));
+      write_completion.insert( std::pair<long,librados::AioCompletion*>(i,librados::Rados::aio_create_completion()));
      }
 
-     std::map<int,bufferlist>::iterator it;
-     std::map<int,librados::AioCompletion*>::iterator cit;
+     std::map<long,bufferlist>::iterator it;
+     std::map<long,librados::AioCompletion*>::iterator cit;
+     FINISH_TIMER; // Compute total time since START_TIMER
+     std::cout << "Setup for write test using AIO." << std::endl;
+     REPORT_TIMING; // Print out the benchmark for this test
+
      START_TIMER; // Code for the begin_time
      for (it=encoded.begin(),cit=write_completion.begin(); it!=encoded.end()||cit!=write_completion.end(); it++,cit++) {
        std::stringstream object_name;
@@ -478,17 +515,22 @@ int main(int argc, const char **argv)
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
   {
-    std::map<int,bufferlist> encoded;
-    std::map<int,librados::AioCompletion*> read_completion;
-    for (int i=ITERATIONS+1;i<2*ITERATIONS;i++) {
+    START_TIMER; // Code for the begin_time
+    std::map<long,bufferlist> encoded;
+    std::map<long,librados::AioCompletion*> read_completion;
+    for (long i=START_ITERATIONS+2*ITERATIONS+1;i<3*ITERATIONS+START_ITERATIONS;i++) {
       librados::bufferlist bl;
-      encoded.insert( std::pair<int,bufferlist>(i,bl));
-      read_completion.insert( std::pair<int,librados::AioCompletion*>(i,librados::Rados::aio_create_completion()));
+      encoded.insert( std::pair<long,bufferlist>(i,bl));
+      read_completion.insert( std::pair<long,librados::AioCompletion*>(i,librados::Rados::aio_create_completion()));
      }
 
-     int read_len = BUFFER_SIZE; // this is way more than we need
-     std::map<int,bufferlist>::iterator it;
-     std::map<int,librados::AioCompletion*>::iterator cit;
+     long read_len = BUFFER_SIZE; // this is way more than we need
+     std::map<long,bufferlist>::iterator it;
+     std::map<long,librados::AioCompletion*>::iterator cit;
+     FINISH_TIMER; // Compute total time since START_TIMER
+     std::cout << "Setup for asynchronous read test." << std::endl;
+     REPORT_TIMING; // Print out the benchmark for this test
+
      START_TIMER; // Code for the begin_time
      for (it=encoded.begin(),cit=read_completion.begin(); it!=encoded.end()||cit!=read_completion.end(); it++,cit++) {
        std::stringstream object_name;
@@ -523,7 +565,7 @@ int main(int argc, const char **argv)
      std::cout << "Reading asynchronously." << std::endl;
      REPORT_BENCHMARK; // Print out the benchmark for this test
    }
-
+  START_TIMER; // Code for the begin_time
   ret = EXIT_SUCCESS;
   out:
   /*
@@ -539,5 +581,9 @@ int main(int argc, const char **argv)
 
   rados.shutdown();
 
+  FINISH_TIMER; // Compute total time since START_TIMER
+  std::cout << "Reading asynchronously." << std::endl;
+  REPORT_TIMING; // Print out the benchmark for this test
+  std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
   return ret;
 }

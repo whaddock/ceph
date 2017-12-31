@@ -1,7 +1,7 @@
 CXXFLAGS=-std=c++11 -I../../src/include  -I../../src
 CFLAGS=-I../../src/include
 LDFLAGS=-lrados -lradosstriper
-all: librados_hello_world librados_hello_world_c my_radosstriper librados_my_hello_world
+all: librados_hello_world librados_hello_world_c my_radosstriper librados_my_hello_world aio_write_test aio_write_test_queue
 
 librados_hello_world: hello_world.cc
 	g++ -g -c hello_world.cc -o hello_world.o $(CXXFLAGS)
@@ -23,9 +23,19 @@ librados_my_hello_world: my_hello_world.cc
 	g++ -g -c my_hello_world.cc -o my_hello_world.o $(CXXFLAGS)
 	g++ -g my_hello_world.o  -o librados_my_hello_world $(LDFLAGS)
 
+aio_write_test: rados_aio_write_test.cc
+	g++ -g -c rados_aio_write_test.cc -o rados_aio_write_test.o $(CXXFLAGS)
+	g++ -g rados_aio_write_test.o  -o rados_aio_write_test $(LDFLAGS)
+
+aio_write_test_queue: rados_aio_write_test_queue.cc
+	g++ -g -c rados_aio_write_test_queue.cc -o rados_aio_write_test_queue.o $(CXXFLAGS)
+	g++ -g rados_aio_write_test_queue.o  -o rados_aio_write_test_queue $(LDFLAGS)
+
 clean:
 	rm hello_world.o librados_hello_world
 	rm hello_world_c.o librados_hello_world_c
 	rm my_hello_radosstriper.o  my_hello_radosstriper
 	rm my_hello_radosstriper_aio.o  my_hello_radosstriper_aio
 	rm my_hello_world.o my_librados_hello_world
+	rm rados_aio_write_test.o rados_aio_write_test
+	rm rados_aio_write_test_queue.o rados_aio_write_test_queue

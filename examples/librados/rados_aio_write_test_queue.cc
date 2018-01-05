@@ -25,17 +25,55 @@
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock(); \
                total_time_ms = (end_time - begin_time) / (double)(CLOCKS_PER_SEC / 1000);
-#define REPORT_TIMING std::cout << total_time_ms  << " ms\t" << std::endl;
-#define REPORT_BENCHMARK std::cout << total_time_ms  << " ms\t" << ((double)stripe_size * (double)object_size) / (1024*1024) << " MB\t" \
+#define REPORT_TIMING std::cerr << total_time_ms  << " ms\t" << std::endl;
+#define REPORT_BENCHMARK std::cerr << total_time_ms  << " ms\t" << ((double)stripe_size * (double)object_size) / (1024*1024) << " MB\t" \
   << ((double)stripe_size * (double)object_size) / (double)(1024*total_time_ms) << " MB/s" << std::endl; \
   total_run_time_ms += total_time_ms;
 #define POOL_NAME "hello_world_pool_1"
+
+// Class to hold stripe record
+class Stripe {
+ public:
+  uint32_t stripe;
+  uint32_t shard;
+  uint32_t stripe_size;
+
+  Stripe(uint32_t stripe, uint32_t shard, uint32_t stripe_size) 
+    : stripe (stripe), shard (shard), stripe_size (stripe_size) {};
+
+  ~Stripe() {};
+
+  uint32_t get_stripe() {
+    return this->stripe;
+  }
+  uint32_t get_shard() {
+    return this->shard;
+  }
+  uint32_t get_hash() {
+    return this->stripe_size*this->stripe+this->shard;
+  }
+};
+
+// Rados write completion callback
+void rados_write_safe_cb(rados_completion_t c, void *arg) {
+  Stripe * data = (Stripe *)arg;
+  std::cerr << std::clock() / (double)(CLOCKS_PER_SEC / 1000) << 
+    " Rados Write Safe Callback called with " << data->get_hash() << std::endl;
+  //    "," << (rados_completion_t)c->is_complete() << "," << (rados_completion_t)c->get_return_value() << std::endl;
+}
+
+void rados_write_complete_cb(rados_completion_t c, void *arg) {
+  Stripe * data = (Stripe *)arg;
+  std::cerr << std::clock() / (double)(CLOCKS_PER_SEC / 1000) << 
+    " Rados Write Complete Callback called with " << data->get_hash() << std::endl;
+  //    "," << c->is_complete() << "," << c->get_return_value() << std::endl;
+}
 
 int main(int argc, const char **argv)
 {
   if(argc < 7)
   {
-      std::cout <<"Please put in correct params\n"<<
+      std::cerr <<"Please put in correct params\n"<<
 	"Iterations:\n"<<
 	"Stripe Size (Number of shards):\n" <<
 	"Queue Size:\n" <<
@@ -64,12 +102,12 @@ int main(int argc, const char **argv)
   std::clock_t total_run_time_ms = 0;
 
   START_TIMER; // Code for the begin_time
-  std::cout << "Iterations = " << iterations << std::endl;
-  std::cout << "Stripe Size = " << stripe_size << std::endl;
-  std::cout << "Queue Size = " << queue_size << std::endl;
-  std::cout << "Object Size = " << object_size << std::endl;
-  std::cout << "Object Name Prefix = " << obj_name << std::endl;
-  std::cout << "Pool Name = " << pool_name << std::endl;
+  std::cerr << "Iterations = " << iterations << std::endl;
+  std::cerr << "Stripe Size = " << stripe_size << std::endl;
+  std::cerr << "Queue Size = " << queue_size << std::endl;
+  std::cerr << "Object Size = " << object_size << std::endl;
+  std::cerr << "Object Name Prefix = " << obj_name << std::endl;
+  std::cerr << "Pool Name = " << pool_name << std::endl;
 
   // first, we create a Rados object and initialize it
   librados::Rados rados;
@@ -80,7 +118,7 @@ int main(int argc, const char **argv)
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cout << "we just set up a rados cluster object" << std::endl;
+      std::cerr << "we just set up a rados cluster object" << std::endl;
     }
   }
 
@@ -97,7 +135,7 @@ int main(int argc, const char **argv)
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cout << "we just parsed our config options" << std::endl;
+      std::cerr << "we just parsed our config options" << std::endl;
       // We also want to apply the config file if the user specified
       // one, and conf_parse_argv won't do that for us.
       for (int i = 0; i < argc; ++i) {
@@ -126,7 +164,7 @@ int main(int argc, const char **argv)
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cout << "we just connected to the rados cluster" << std::endl;
+      std::cerr << "we just connected to the rados cluster" << std::endl;
     }
   }
 
@@ -140,7 +178,7 @@ int main(int argc, const char **argv)
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cout << "we just created an ioctx for our pool" << std::endl;
+      std::cerr << "we just created an ioctx for our pool" << std::endl;
     }
   }
 
@@ -165,25 +203,34 @@ int main(int argc, const char **argv)
     }
 
     // Get a stripe of bufferlists from the queue
-    std::map<long,bufferlist> encoded;
-    std::map<long,librados::AioCompletion*> write_completion;
+    std::map<uint32_t,bufferlist> encoded;
+    std::map<uint32_t,librados::AioCompletion*> write_completion;
+    std::map<uint32_t,Stripe> stripe_data;
 
     // the iteration loop begins here
     for (uint32_t j=0;j<iterations;j++) {
       for (uint32_t i=0;i<stripe_size;i++) {
-	encoded.insert( std::pair<long,bufferlist>(i,blq.front()));
+	encoded.insert( std::pair<uint32_t,bufferlist>(i,blq.front()));
 	blq.pop(); // remove the bl from the queue
-	write_completion.insert( std::pair<long,librados::AioCompletion*>(i,librados::Rados::aio_create_completion()));
+	Stripe data(j,i,stripe_size);
+	std::cerr << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	stripe_data.insert(std::pair<uint32_t,Stripe>(data.get_hash(),data));
+	write_completion.insert( 
+				std::pair<uint32_t,
+				librados::AioCompletion*>
+				(j*stripe_size+i,
+				 librados::Rados::aio_create_completion((void *)&data,NULL,
+									(rados_callback_t) rados_write_safe_cb)));
       }
 
-      std::map<long,bufferlist>::iterator it;
-      std::map<long,librados::AioCompletion*>::iterator cit;
+      std::map<uint32_t,bufferlist>::iterator it;
+      std::map<uint32_t,librados::AioCompletion*>::iterator cit;
       FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Setup for write test using AIO." << std::endl;
+      std::cerr << "Setup for write test using AIO." << std::endl;
       REPORT_TIMING; // Print out the benchmark for this test
 
       START_TIMER; // Code for the begin_time
-      for (it=encoded.begin(),cit=write_completion.begin(); it!=encoded.end()||cit!=write_completion.end(); it++,cit++) {
+      for (it=encoded.begin(),cit=write_completion.find(j*stripe_size); it!=encoded.end()||cit!=write_completion.end(); it++,cit++) {
 	std::stringstream object_name;
 	object_name << obj_name << "-" << j << "-" << it->first;
 	ret = io_ctx.aio_write_full(object_name.str(), cit->second, it->second);
@@ -194,9 +241,9 @@ int main(int argc, const char **argv)
 	}
       }
        
-      for (cit=write_completion.begin();cit!=write_completion.end();cit++) {
+      for (cit=write_completion.find(j*stripe_size);cit!=write_completion.end();cit++) {
 	// wait for the request to complete, and check that it succeeded.
-	cit->second->wait_for_complete();
+	cit->second->wait_for_safe();
 	std::stringstream object_name;
 	object_name  << obj_name << "-" << j << "-" << cit->first;
 	ret = cit->second->get_return_value();
@@ -208,7 +255,7 @@ int main(int argc, const char **argv)
 	  blq.push(encoded[cit->first]);
 	  if (DEBUG > 0) {
 	    cit->second->release();
-	    std::cout << "we wrote our object " << object_name.str()
+	    std::cerr << "we wrote our object " << object_name.str()
 		      << ", and got back " << ret << " bytes with contents\n"
 		      << "Size of buffer was " << it->second.length() << std::endl;
 	  }
@@ -217,9 +264,15 @@ int main(int argc, const char **argv)
       encoded.clear();
       write_completion.clear();
       FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Writing aio test. Iteration " << j << " Queue size " << blq.size() << std::endl;
+      std::cerr << "Writing aio test. Iteration " << j << " Queue size " << blq.size() << std::endl;
       REPORT_BENCHMARK; // Print out the benchmark for this test
    }
+    // Print out the stripe object hashes and clear the stripe_data map
+    std::map<uint32_t,Stripe>::iterator sit;
+    for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
+      std::cerr << "Deleting Stripe object with hash value " << sit->second.get_hash() << std::endl;
+    }
+    stripe_data.clear();
   }
 
   START_TIMER; // Code for the begin_time
@@ -229,8 +282,8 @@ int main(int argc, const char **argv)
   rados.shutdown();
 
   FINISH_TIMER; // Compute total time since START_TIMER
-  std::cout << "Cleanup." << std::endl;
+  std::cerr << "Cleanup." << std::endl;
   REPORT_TIMING; // Print out the elapsed time for this section
-  std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
+  std::cerr << "Total run time " << total_run_time_ms << " ms" << std::endl;
   return ret;
 }

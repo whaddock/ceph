@@ -104,7 +104,7 @@ void handleAioCompletions() {
   while (!write_completion.empty()&&!done) {
     // wait for the request to complete, and check that it succeeded.
     for (cit=write_completion.begin();cit!=write_completion.end()||failed;cit++) {
-      if(cit->second->is_safe()) {
+      if(cit->second->wait_for_safe()) {
 	cit->second->release();
 	if (ret < 0) {
 	  std::cerr << "couldn't write object " << stripe_data.find(cit->first)->second.get_object_name()

@@ -20,6 +20,7 @@
 #include <deque>
 #include <queue>
 #include <map>
+#include <cassert>
 
 #define DEBUG 0
 #define START_TIMER begin_time = std::clock();
@@ -37,9 +38,13 @@ class Stripe {
   uint32_t stripe;
   uint32_t shard;
   uint32_t stripe_size;
+  std::string object_name;
 
-  Stripe(uint32_t stripe, uint32_t shard, uint32_t stripe_size) 
-    : stripe (stripe), shard (shard), stripe_size (stripe_size) {};
+  Stripe(uint32_t _stripe, uint32_t _shard, uint32_t _stripe_size,
+	 std::string _object_name) 
+    : stripe (_stripe), shard (_shard), stripe_size (_stripe_size),
+      object_name (_object_name) {};
+
 
   ~Stripe() {};
 
@@ -50,7 +55,13 @@ class Stripe {
     return this->shard;
   }
   uint32_t get_hash() {
-    return this->stripe_size*this->stripe+this->shard;
+    return Stripe::compute_hash(this->shard,this->stripe,this->stripe_size);
+  }
+  std::string get_object_name() {
+    return object_name;
+  }
+  static uint32_t compute_hash(uint32_t _i,uint32_t _j, uint32_t _stripe_size) {
+    return _j*_stripe_size+_i;
   }
 };
 
@@ -206,36 +217,48 @@ int main(int argc, const char **argv)
     std::map<uint32_t,bufferlist> encoded;
     std::map<uint32_t,librados::AioCompletion*> write_completion;
     std::map<uint32_t,Stripe> stripe_data;
+    std::map<uint32_t,bufferlist>::iterator it;
+    std::map<uint32_t,librados::AioCompletion*>::iterator cit;
 
     // the iteration loop begins here
     for (uint32_t j=0;j<iterations;j++) {
+      uint32_t index = 0; // index = data.get_hash()
       for (uint32_t i=0;i<stripe_size;i++) {
-	encoded.insert( std::pair<uint32_t,bufferlist>(i,blq.front()));
-	blq.pop(); // remove the bl from the queue
-	Stripe data(j,i,stripe_size);
-	std::cerr << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	index = j*stripe_size+i;
+	std::stringstream object_name;
+	object_name << obj_name << "." << index;
+	Stripe data(j,i,stripe_size,object_name.str());
+	assert(index==data.get_hash()); // disable assert by defining #NDEBUG
 	stripe_data.insert(std::pair<uint32_t,Stripe>(data.get_hash(),data));
+	encoded.insert( std::pair<uint32_t,bufferlist>(data.get_hash(),blq.front()));
+	blq.pop(); // remove the bl from the queue
+	std::cerr << "Created a Stripe with hash value " << data.get_hash() << std::endl;
 	write_completion.insert( 
 				std::pair<uint32_t,
 				librados::AioCompletion*>
-				(j*stripe_size+i,
-				 librados::Rados::aio_create_completion((void *)&data,NULL,
-									(rados_callback_t) rados_write_safe_cb)));
+				(data.get_hash(),
+				 librados::Rados::
+				 aio_create_completion((void *)&data,NULL,NULL)));
       }
 
-      std::map<uint32_t,bufferlist>::iterator it;
-      std::map<uint32_t,librados::AioCompletion*>::iterator cit;
       FINISH_TIMER; // Compute total time since START_TIMER
       std::cerr << "Setup for write test using AIO." << std::endl;
       REPORT_TIMING; // Print out the benchmark for this test
-
+    
       START_TIMER; // Code for the begin_time
       for (it=encoded.begin(),cit=write_completion.find(j*stripe_size); it!=encoded.end()||cit!=write_completion.end(); it++,cit++) {
-	std::stringstream object_name;
-	object_name << obj_name << "-" << j << "-" << it->first;
-	ret = io_ctx.aio_write_full(object_name.str(), cit->second, it->second);
+	try{
+	  Stripe data = stripe_data.at(cit->first);
+	  ret = io_ctx.aio_write_full(data.get_object_name(), cit->second, it->second);
+	}
+	catch (std::out_of_range& e) {
+	  std::cerr << "Out of range error accessing stripe_data. " 
+		    << std::endl;
+	  ret = -1;
+	}
 	if (ret < 0) {
-	  std::cerr << "couldn't start write object! error " << object_name.str() << " " << ret << std::endl;
+	  std::cerr << "couldn't start write object! error " << cit->first
+	  << " " << ret << std::endl;
 	  ret = EXIT_FAILURE;
 	  goto out;
 	}
@@ -244,34 +267,35 @@ int main(int argc, const char **argv)
       for (cit=write_completion.find(j*stripe_size);cit!=write_completion.end();cit++) {
 	// wait for the request to complete, and check that it succeeded.
 	cit->second->wait_for_safe();
-	std::stringstream object_name;
-	object_name  << obj_name << "-" << j << "-" << cit->first;
 	ret = cit->second->get_return_value();
 	if (ret < 0) {
-	  std::cerr << "couldn't write object " << object_name.str() << "! error " << ret << std::endl;
+	  std::cerr << "couldn't write object " << cit->first << "! error " << ret << std::endl;
 	  ret = EXIT_FAILURE;
 	  goto out;
 	} else {
 	  blq.push(encoded[cit->first]);
+	  cit->second->release();
 	  if (DEBUG > 0) {
-	    cit->second->release();
-	    std::cerr << "we wrote our object " << object_name.str()
+	    std::cerr << "we wrote our object "
+		      << cit->first
 		      << ", and got back " << ret << " bytes with contents\n"
-		      << "Size of buffer was " << it->second.length() << std::endl;
+		      << "Size of buffer was " << encoded[cit->first].length()
+		      << std::endl;
 	  }
 	}
       }
       encoded.clear();
       write_completion.clear();
       FINISH_TIMER; // Compute total time since START_TIMER
-      std::cerr << "Writing aio test. Iteration " << j << " Queue size " << blq.size() << std::endl;
+      std::cerr << "Writing aio test. Iteration " << j << " Queue size "
+		<< blq.size() << std::endl;
       REPORT_BENCHMARK; // Print out the benchmark for this test
    }
     // Print out the stripe object hashes and clear the stripe_data map
     std::map<uint32_t,Stripe>::iterator sit;
     for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
       std::cerr << "Deleting Stripe object with hash value " << sit->second.get_hash() << std::endl;
-    }
+    } // End of outer j loop
     stripe_data.clear();
   }
 

@@ -106,27 +106,30 @@ void handleAioCompletions() {
   std::cerr << "About to enter while loop in handleAioCompletions(). " << std::endl
 	    << "write_completion map has " << write_completion.size() << " records. " << std::endl
 	    << "The done boolean is " << done << std::endl;
-  while (!write_completion.empty()||!done) {
+  while (!done) {
     // wait for the request to complete, and check that it succeeded.
-    std::cerr << "In handleAioCompletions() while loop." << std::endl;
-    for (cit=write_completion.begin();cit!=write_completion.end()||failed;cit++) {
-      std::cerr << "Waiting for " << cit->first << " in handleAioCompletions()" << std::endl;
-      cit->second->wait_for_safe();
-      cit->second->release();
-      blq_lock.lock(); // Get a lock on the bufferlist queue
-      pending_buffers_lock.lock();
-      blq.push(pending_buffers[cit->first]);
-      pending_buffers_lock.unlock();
-      blq_lock.unlock(); // Release lock on the bufferlist queue
-      write_completion_lock.lock(); // Get a lock on the write_completion map
-      write_completion.erase(cit);
-      write_completion_lock.unlock(); // Release lock on the write_completion map
-      if (DEBUG > 0) {
-	std::cerr << "we wrote our object " << stripe_data.find(cit->first)->second.get_object_name() 
-		  << std::endl;
+    std::cerr << "In handleAioCompletions() outer while loop." << std::endl;
+    for (cit=write_completion.begin();cit!=write_completion.end();cit++) {
+      std::cerr << "Checking for " << cit->first 
+		<< " safe in handleAioCompletions()" << std::endl;
+      if (cit->second->is_safe() ) {
+	std::cerr << cit->first << " is safe in handleAioCompletions()" << std::endl;
+	cit->second->release();
+	blq_lock.lock(); // Get a lock on the bufferlist queue
+	pending_buffers_lock.lock();
+	blq.push(pending_buffers[cit->first]);
+	pending_buffers_lock.unlock();
+	blq_lock.unlock(); // Release lock on the bufferlist queue
+	write_completion_lock.lock(); // Get a lock on the write_completion map
+	write_completion.erase(cit);
+	write_completion_lock.unlock(); // Release lock on the write_completion map
+	if (DEBUG > 0) {
+	  std::cerr << "we wrote our object " << stripe_data.find(cit->first)->second.get_object_name() 
+		    << std::endl;
+	}
       }
     }
-    std::chrono::milliseconds duration(500);
+    std::chrono::milliseconds duration(250);
     std::this_thread::sleep_for(duration);
   }
 }
@@ -320,13 +323,22 @@ int main(int argc, const char **argv)
 
       START_TIMER; // Code for the begin_time
       write_completion_lock.lock();
-      for (it=encoded.begin(),cit=write_completion.find(j*stripe_size); it!=encoded.end()||cit!=write_completion.end()||failed; it++,cit++) {
 	try {
-	  Stripe data = stripe_data.at(cit->first);
-	  ret = io_ctx.aio_write_full(data.get_object_name(), cit->second, it->second);
+	  cit = write_completion.at(j*stripe_size);
+	  it = encoded.at(j*stripe_size);
+	  sit = stripe_data.at(j*stripe_size);
 	}
 	catch (std::out_of_range& e) {
-	  std::cerr << "Out of range error accessing stripe_data. " << cit->first << std::endl;
+	  std::cerr << "Out of range error accessing stripe_data. cit " << cit->first
+		    << "it " << it->first << "sit " << sit->first << std::endl;
+	  ret = -1;
+	}
+	for (it,cit); it!=encoded.end()||cit!=write_completion.end()||failed; it++,cit++) {
+	try {
+	  ret = io_ctx.aio_write_full(data.get_object_name(), cit->second, it->second);
+	}
+	catch (std::exception& e) {
+	  std::cerr << "Exception while writing object. " << cit->first << std::endl;
 	  ret = -1;
 	}
 	if (ret < 0) {

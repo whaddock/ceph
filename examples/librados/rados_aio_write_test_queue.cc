@@ -69,16 +69,16 @@ class Stripe {
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::map<uint32_t,bufferlist> encoded;
-std::map<uint32_t,bufferlist> pending_buffers;
+std::map<uint32_t,bufferlist> encoded, pending_buffers;
+std::map<uint32_t,bufferlist>::iterator it,pbit;
 std::map<uint32_t,librados::AioCompletion*> write_completion;
-std::map<uint32_t,Stripe> stripe_data;
-std::map<uint32_t,bufferlist>::iterator it;
 std::map<uint32_t,librados::AioCompletion*>::iterator cit;
+std::map<uint32_t,Stripe> stripe_data;
 std::map<uint32_t,Stripe>::iterator sit;
 bool done = false; //Becomes true at the end before we try to join the AIO competion thread.
 bool failed = false; // Used as a flag to indicate that a failure has occurred
 int ret = 0;
+uint32_t stripe_size = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex blq_lock;
@@ -104,24 +104,67 @@ void handleAioCompletions() {
     std::cerr << "Starting handleAioCompletions()" << std::endl;
   }
   std::cerr << "About to enter while loop in handleAioCompletions(). " << std::endl
-	    << "write_completion map has " << write_completion.size() << " records. " << std::endl
+	    << "write_completion map has " << write_completion.size()
+	    << " records. " << std::endl
 	    << "The done boolean is " << done << std::endl;
   while (!done) {
     // wait for the request to complete, and check that it succeeded.
     std::cerr << "In handleAioCompletions() outer while loop." << std::endl;
-    for (cit=write_completion.begin();cit!=write_completion.end();cit++) {
-      std::cerr << "Checking for " << cit->first 
-		<< " safe in handleAioCompletions()" << std::endl;
-      if (cit->second->is_safe() ) {
+    if(pending_buffers.size()>stripe_size) {
+      write_completion_lock.lock(); // Get a lock on the write_completion map
+      for (cit=write_completion.begin();
+	   cit!=write_completion.end();cit++) {
+	std::cerr << "Checking for " << cit->first 
+		  << " safe in handleAioCompletions()" << std::endl;
+	cit->second->wait_for_safe();
 	std::cerr << cit->first << " is safe in handleAioCompletions()" << std::endl;
-	cit->second->release();
 	blq_lock.lock(); // Get a lock on the bufferlist queue
 	pending_buffers_lock.lock();
-	blq.push(pending_buffers[cit->first]);
+	try {
+	  pbit = pending_buffers.find(cit->first);
+	  std::cerr << pbit->first << " pending buffer in handleAioCompletions()"
+		    << "pending_buffers size " << pending_buffers.size() << std::endl;
+	  std::cerr.flush();
+	  if (pbit!= pending_buffers.end()) {
+	    blq.push(pbit->second);
+	    std::cerr << cit->first << " buffer to blq in handleAioCompletions()"
+		      << std::endl;
+	    pending_buffers.erase(pbit);
+	    std::cerr << cit->first
+		      << " pending buffer erased in handleAioCompletions()"
+		      << std::endl;
+	  }
+	}
+	catch (std::out_of_range& e) {
+	  std::cerr << "Out of range error accessing pending_buffers "
+		    << "in AIO thread."
+		    << " cit " << cit->first << "it " << it->first
+		    << "sit " << sit->first << std::endl;
+	  ret = -1;
+	}
 	pending_buffers_lock.unlock();
 	blq_lock.unlock(); // Release lock on the bufferlist queue
-	write_completion_lock.lock(); // Get a lock on the write_completion map
+	std::cerr << cit->first
+		  << " about to release AIOCompletion in handleAioCompletions()"
+		  << std::endl;
+	std::cerr.flush();
+	cit->second->release();
+	std::cerr << cit->first
+		  << " released AIOCompletion in handleAioCompletions()"
+		  << std::endl;
+	std::cerr.flush();
+	std::cerr << pbit->first << " pending buffer in handleAioCompletions()"
+		  << "pending_buffers size after push is " << pending_buffers.size()
+		  << std::endl;
+	std::cerr.flush();
+	std::cerr << cit->first << " AIOCompletion map in handleAioCompletions()"
+		  << "map size before erase " << write_completion.size() << std::endl;
+	std::cerr.flush();
+	/* FAILING HERE */
 	write_completion.erase(cit);
+	std::cerr << cit->first << " AIOCompletion map in handleAioCompletions()"
+		  << "map size after erase " << write_completion.size() << std::endl;
+	std::cerr.flush();
 	write_completion_lock.unlock(); // Release lock on the write_completion map
 	if (DEBUG > 0) {
 	  std::cerr << "we wrote our object " << stripe_data.find(cit->first)->second.get_object_name() 
@@ -165,7 +208,7 @@ int main(int argc, const char **argv)
       return EXIT_FAILURE;
   }
   uint32_t iterations = std::stoi(argv[1]);
-  uint32_t stripe_size = std::stoi(argv[2]);
+  stripe_size = std::stoi(argv[2]);
   uint32_t queue_size = std::stoi(argv[3]);
   uint32_t object_size = std::stoi(argv[4]);
   std::string obj_name = argv[5];
@@ -324,45 +367,60 @@ int main(int argc, const char **argv)
       START_TIMER; // Code for the begin_time
       write_completion_lock.lock();
 	try {
-	  cit = write_completion.at(j*stripe_size);
-	  it = encoded.at(j*stripe_size);
-	  sit = stripe_data.at(j*stripe_size);
+	  cit = write_completion.find(j*stripe_size);
+	  it = encoded.find(j*stripe_size);
+	  if(cit==write_completion.end()||it==encoded.end()) {
+	    //   std::throw std::out_of_range;
+	  }
 	}
 	catch (std::out_of_range& e) {
-	  std::cerr << "Out of range error accessing stripe_data. cit " << cit->first
-		    << "it " << it->first << "sit " << sit->first << std::endl;
+	  std::cerr << "Out of range error accessing stripe_data. At index "
+		    << index << "." << std::endl;
 	  ret = -1;
 	}
-	for (it,cit); it!=encoded.end()||cit!=write_completion.end()||failed; it++,cit++) {
-	try {
-	  ret = io_ctx.aio_write_full(data.get_object_name(), cit->second, it->second);
+	for (it,cit; it!=encoded.end()||cit!=write_completion.end()||failed; 
+	     it++,cit++) {
+	  try {
+	    ret = io_ctx.aio_write_full(
+					stripe_data.find(index)->second.get_object_name(), 
+					cit->second, it->second);
+	  }
+	  catch (std::exception& e) {
+	    std::cerr << "Exception while writing object. "
+		      << cit->first << std::endl;
+	    ret = -1;
+	  }
+	  if (ret < 0) {
+	    std::cerr << "couldn't start write object! error at index "
+		      << index << std::endl;
+	    ret = EXIT_FAILURE;
+	    failed = true; 
+	    // We have had a failure, so do not execute any further, 
+	    //fall through.
+	  }
 	}
-	catch (std::exception& e) {
-	  std::cerr << "Exception while writing object. " << cit->first << std::endl;
-	  ret = -1;
+	write_completion_lock.unlock(); // if there is a failure in
+	std::cerr << "The write_completion map length is " << write_completion.size()
+	<< std::endl;
+	// the previous block, this will still work
+	pending_buffers_lock.lock();
+	for (it=encoded.begin();
+	     it!=encoded.end()||failed; it++,cit++) {
+	  pending_buffers.insert(std::pair<uint32_t,
+				 bufferlist>(it->first,it->second));
 	}
-	if (ret < 0) {
-	  std::cerr << "couldn't start write object! error " << stripe_data.find(it->first)->second.get_object_name() << " " << ret << std::endl;
-	  ret = EXIT_FAILURE;
-	  failed = true; // We have had a failure, so do not execute any further, fall through.
-	}
-      }
-      write_completion_lock.unlock(); // if there is a failure in the previous block, this will still work
-      pending_buffers_lock.lock();
-      for (it=encoded.begin();
-	   it!=encoded.end()||failed; it++,cit++) {
-	pending_buffers.insert(std::pair<uint32_t,bufferlist>(it->first,it->second));
-      }
-      pending_buffers_lock.unlock();
-      encoded.clear();
-      FINISH_TIMER; // Compute total time since START_TIMER
-      std::cerr << "Writing aio test. Iteration " << j << " Queue size " << blq.size() << std::endl;
-      REPORT_BENCHMARK; // Print out the benchmark for this test
-   }
+	pending_buffers_lock.unlock();
+	encoded.clear();
+	FINISH_TIMER; // Compute total time since START_TIMER
+	std::cerr << "Writing aio test. Iteration " << j << " Queue size "
+		  << blq.size() << std::endl;
+	REPORT_BENCHMARK; // Print out the benchmark for this test
+    }
     // Print out the stripe object hashes and clear the stripe_data map
     if (DEBUG > 0) {
       for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
-	std::cerr << "Deleting Stripe object with hash value " << sit->second.get_hash() << std::endl;
+	std::cerr << "Deleting Stripe object with hash value "
+		  << sit->second.get_hash() << std::endl;
       }
     }
     stripe_data.clear();

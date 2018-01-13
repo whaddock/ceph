@@ -26,11 +26,12 @@
 #include <chrono>
 
 #define DEBUG 1
+#define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock(); \
                total_time_ms = (end_time - begin_time) / (double)(CLOCKS_PER_SEC / 1000);
-#define REPORT_TIMING std::cerr << total_time_ms  << " ms\t" << std::endl;
-#define REPORT_BENCHMARK std::cerr << total_time_ms  << " ms\t" << ((double)stripe_size * (double)object_size) / (1024*1024) << " MB\t" \
+#define REPORT_TIMING std::cout << total_time_ms  << " ms\t" << std::endl;
+#define REPORT_BENCHMARK std::cout << total_time_ms  << " ms\t" << ((double)stripe_size * (double)object_size) / (1024*1024) << " MB\t" \
   << ((double)stripe_size * (double)object_size) / (double)(1024*total_time_ms) << " MB/s" << std::endl; \
   total_run_time_ms += total_time_ms;
 #define POOL_NAME "hello_world_pool_1"
@@ -75,13 +76,18 @@ std::map<uint32_t,librados::AioCompletion*> write_completion;
 std::map<uint32_t,librados::AioCompletion*>::iterator cit;
 std::map<uint32_t,Stripe> stripe_data;
 std::map<uint32_t,Stripe>::iterator sit;
-bool done = false; //Becomes true at the end before we try to join the AIO competion thread.
+bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
+bool completion_done = false; //Becomes true at the end when we all completions are safe
 bool failed = false; // Used as a flag to indicate that a failure has occurred
 int ret = 0;
 uint32_t stripe_size = 0;
+uint32_t blq_last_size;
+uint32_t completions_that_remain = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
+std::mutex output_lock;
 std::mutex blq_lock;
+std::mutex encoded_lock;
 std::mutex pending_buffers_lock;
 std::mutex write_completion_lock;
 std::mutex stripe_data_lock;
@@ -96,84 +102,140 @@ std::mutex stripe_data_lock;
  * At the end of the program execution, the thread is joined which causes the
  * program execution to wait until the completion_q is empty, i.e, all of the
  * objects are safe on disk.
+ * @rados_done means that the main thread has finished writing shards/objects.
+ * @completion_done means that the rados has finished writing shards/objects.
  */
 void handleAioCompletions() {
   bool started = false;
   if(!started) {
     started = true;
-    std::cerr << "Starting handleAioCompletions()" << std::endl;
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting handleAioCompletions()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
   }
-  std::cerr << "About to enter while loop in handleAioCompletions(). " << std::endl
-	    << "write_completion map has " << write_completion.size()
+  write_completion_lock.lock();
+  completions_that_remain = write_completion.size();
+  output_lock.lock();
+  std::cerr THREAD_ID << "About to enter while loop in handleAioCompletions(). " << std::endl
+	    << "\twrite_completion map has " << completions_that_remain
 	    << " records. " << std::endl
-	    << "The done boolean is " << done << std::endl;
-  while (!done) {
+	    << "\tThe rados_done boolean is " << rados_done << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+  write_completion_lock.unlock();
+  while (!rados_done&&!completion_done) {
     // wait for the request to complete, and check that it succeeded.
-    std::cerr << "In handleAioCompletions() outer while loop." << std::endl;
+    output_lock.lock();
+    std::cerr THREAD_ID  << "In handleAioCompletions() outer while loop." << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+    pending_buffers_lock.lock();
     if(pending_buffers.size()>stripe_size) {
+      output_lock.lock();
+      std::cerr THREAD_ID  << "pending_buffers size > stripe_size" << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+      stripe_data_lock.lock();
       write_completion_lock.lock(); // Get a lock on the write_completion map
-      for (cit=write_completion.begin();
-	   cit!=write_completion.end();cit++) {
-	std::cerr << "Checking for " << cit->first 
+      blq_lock.lock(); // Get a lock on the bufferlist queue
+      completions_that_remain = write_completion.size();
+      if (completions_that_remain > 0) {
+	cit=write_completion.begin();
+	//      for (cit=write_completion.begin();
+	//	   cit!=write_completion.end();cit++) {
+	output_lock.lock();
+	std::cerr THREAD_ID  << "Checking for " << cit->first 
 		  << " safe in handleAioCompletions()" << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 	cit->second->wait_for_safe();
-	std::cerr << cit->first << " is safe in handleAioCompletions()" << std::endl;
-	blq_lock.lock(); // Get a lock on the bufferlist queue
-	pending_buffers_lock.lock();
+	output_lock.lock();
+	std::cerr THREAD_ID << "cit: " << cit->first << " is safe in handleAioCompletions()"
+		  << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 	try {
 	  pbit = pending_buffers.find(cit->first);
-	  std::cerr << pbit->first << " pending buffer in handleAioCompletions()"
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "pbit: " << pbit->first << " pending buffer in handleAioCompletions()"
 		    << "pending_buffers size " << pending_buffers.size() << std::endl;
 	  std::cerr.flush();
+	  output_lock.unlock();
 	  if (pbit!= pending_buffers.end()) {
 	    blq.push(pbit->second);
-	    std::cerr << cit->first << " buffer to blq in handleAioCompletions()"
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "cit: " << cit->first << " buffer to blq in handleAioCompletions()"
 		      << std::endl;
+	    output_lock.unlock();
 	    pending_buffers.erase(pbit);
-	    std::cerr << cit->first
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "cit: " << cit->first
 		      << " pending buffer erased in handleAioCompletions()"
 		      << std::endl;
+	    output_lock.unlock();
 	  }
 	}
 	catch (std::out_of_range& e) {
-	  std::cerr << "Out of range error accessing pending_buffers "
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
 		    << "in AIO thread."
 		    << " cit " << cit->first << "it " << it->first
 		    << "sit " << sit->first << std::endl;
+	  output_lock.unlock();
 	  ret = -1;
 	}
-	pending_buffers_lock.unlock();
-	blq_lock.unlock(); // Release lock on the bufferlist queue
-	std::cerr << cit->first
+	output_lock.lock();
+	std::cerr THREAD_ID << "cit: " << cit->first
 		  << " about to release AIOCompletion in handleAioCompletions()"
 		  << std::endl;
 	std::cerr.flush();
+	output_lock.unlock();
 	cit->second->release();
-	std::cerr << cit->first
+	output_lock.lock();
+	std::cerr THREAD_ID << "cit: " << cit->first
 		  << " released AIOCompletion in handleAioCompletions()"
 		  << std::endl;
 	std::cerr.flush();
-	std::cerr << pbit->first << " pending buffer in handleAioCompletions()"
-		  << "pending_buffers size after push is " << pending_buffers.size()
-		  << std::endl;
+	std::cerr THREAD_ID << "pbit: " << pbit->first
+			    << " pending buffer in handleAioCompletions()"
+			    << "pending_buffers size after push is "
+			    << pending_buffers.size()
+			    << std::endl;
 	std::cerr.flush();
-	std::cerr << cit->first << " AIOCompletion map in handleAioCompletions()"
-		  << "map size before erase " << write_completion.size() << std::endl;
+	std::cerr THREAD_ID << "cit: " <<cit->first
+			    << " AIOCompletion map in handleAioCompletions()"
+			    << "map size before erase "
+			    << completions_that_remain << std::endl;
 	std::cerr.flush();
-	/* FAILING HERE */
+	output_lock.unlock();
 	write_completion.erase(cit);
-	std::cerr << cit->first << " AIOCompletion map in handleAioCompletions()"
-		  << "map size after erase " << write_completion.size() << std::endl;
+	completions_that_remain = write_completion.size();
+	output_lock.lock();
+	std::cerr THREAD_ID << "cit: " << cit->first
+			    << " AIOCompletion map in handleAioCompletions()"
+			    << "map size after erase "
+			    << completions_that_remain << std::endl;
 	std::cerr.flush();
-	write_completion_lock.unlock(); // Release lock on the write_completion map
+	output_lock.unlock();
+	blq_lock.unlock(); // Release lock on the bufferlist queue
+	pending_buffers_lock.unlock();
 	if (DEBUG > 0) {
-	  std::cerr << "we wrote our object " << stripe_data.find(cit->first)->second.get_object_name() 
-		    << std::endl;
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "we wrote our object "
+			      << stripe_data.find(cit->first)->second.get_object_name() 
+			      << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
 	}
+	stripe_data_lock.unlock();
       }
+      write_completion_lock.unlock(); // Release lock on the write_completion map
+      std::this_thread::yield();
     }
-    std::chrono::milliseconds duration(250);
+    std::chrono::milliseconds duration(25);
     std::this_thread::sleep_for(duration);
+    if (rados_done&& completions_that_remain==0) completion_done = true;
   }
 }
 
@@ -181,32 +243,39 @@ void handleAioCompletions() {
 // Rados write completion callback
 void rados_write_safe_cb(rados_completion_t c, void *arg) {
   Stripe * data = (Stripe *)arg;
-  std::cerr << std::clock() / (double)(CLOCKS_PER_SEC / 1000) << 
-    " Rados Write Safe Callback called with " << data->get_hash() << std::endl;
+  output_lock.lock();
+  std::cerr THREAD_ID << std::clock() / (double)(CLOCKS_PER_SEC / 1000)
+		      << " Rados Write Safe Callback called with "
+		      << data->get_hash() << std::endl;
+  output_lock.unlock();
   //    "," << (rados_completion_t)c->is_complete() << "," << (rados_completion_t)c->get_return_value() << std::endl;
 }
 
 
 void rados_write_complete_cb(rados_completion_t c, void *arg) {
   Stripe * data = (Stripe *)arg;
-  std::cerr << std::clock() / (double)(CLOCKS_PER_SEC / 1000) << 
+  output_lock.lock();
+  std::cerr THREAD_ID << std::clock() / (double)(CLOCKS_PER_SEC / 1000) << 
     " Rados Write Complete Callback called with " << data->get_hash() << std::endl;
+  output_lock.unlock();
   //    "," << c->is_complete() << "," << c->get_return_value() << std::endl;
 }
 
 int main(int argc, const char **argv)
 {
   if(argc < 7)
-  {
-      std::cerr <<"Please put in correct params\n"<<
+    {
+      output_lock.lock();
+      std::cerr THREAD_ID <<"Please put in correct params\n"<<
 	"Iterations:\n"<<
 	"Stripe Size (Number of shards):\n" <<
 	"Queue Size:\n" <<
 	"Object Size:\n" <<
 	"Object Name:\n" <<
 	"Pool Name:"<< std::endl;
+      output_lock.unlock();
       return EXIT_FAILURE;
-  }
+    }
   uint32_t iterations = std::stoi(argv[1]);
   stripe_size = std::stoi(argv[2]);
   uint32_t queue_size = std::stoi(argv[3]);
@@ -227,23 +296,29 @@ int main(int argc, const char **argv)
   std::clock_t total_run_time_ms = 0;
 
   START_TIMER; // Code for the begin_time
-  std::cerr << "Iterations = " << iterations << std::endl;
-  std::cerr << "Stripe Size = " << stripe_size << std::endl;
-  std::cerr << "Queue Size = " << queue_size << std::endl;
-  std::cerr << "Object Size = " << object_size << std::endl;
-  std::cerr << "Object Name Prefix = " << obj_name << std::endl;
-  std::cerr << "Pool Name = " << pool_name << std::endl;
+  output_lock.lock();
+  std::cerr THREAD_ID << "Iterations = " << iterations << std::endl;
+  std::cerr THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
+  std::cerr THREAD_ID << "Queue Size = " << queue_size << std::endl;
+  std::cerr THREAD_ID << "Object Size = " << object_size << std::endl;
+  std::cerr THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
+  std::cerr THREAD_ID << "Pool Name = " << pool_name << std::endl;
+  output_lock.unlock();
 
   // first, we create a Rados object and initialize it
   librados::Rados rados;
   {
       ret = rados.init("admin"); // just use the client.admin keyring
       if (ret < 0) { // let's handle any error that might have come back
-	std::cerr << "couldn't initialize rados! error " << ret << std::endl;
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
+	output_lock.unlock();
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
-	std::cerr << "we just set up a rados cluster object" << std::endl;
+	output_lock.lock();
+	std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
+	output_lock.unlock();
       }
   }
   /*
@@ -255,11 +330,15 @@ int main(int argc, const char **argv)
     ret = rados.conf_parse_argv(argc, argv);
     if (ret < 0) {
       // This really can't happen, but we need to check to be a good citizen.
-      std::cerr << "failed to parse config options! error " << ret << std::endl;
+      output_lock.lock();
+      std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
+      output_lock.unlock();
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cerr << "we just parsed our config options" << std::endl;
+      output_lock.lock();
+      std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
+      output_lock.unlock();
       // We also want to apply the config file if the user specified
       // one, and conf_parse_argv won't do that for us.
       for (int i = 0; i < argc; ++i) {
@@ -267,8 +346,10 @@ int main(int argc, const char **argv)
 	  ret = rados.conf_read_file(argv[i+1]);
 	  if (ret < 0) {
 	    // This could fail if the config file is malformed, but it'd be hard.
-	    std::cerr << "failed to parse config file " << argv[i+1]
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "failed to parse config file " << argv[i+1]
 	              << "! error" << ret << std::endl;
+	    output_lock.unlock();
 	    ret = EXIT_FAILURE;
 	    goto out;
 	  }
@@ -284,11 +365,15 @@ int main(int argc, const char **argv)
     {
     ret = rados.connect();
     if (ret < 0) {
-      std::cerr << "couldn't connect to cluster! error " << ret << std::endl;
+      output_lock.lock();
+      std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
+      output_lock.unlock();
       ret = EXIT_FAILURE;
       goto out;
     } else {
-      std::cerr << "we just connected to the rados cluster" << std::endl;
+      output_lock.lock();
+      std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
+      output_lock.unlock();
     }
   }
 
@@ -298,11 +383,15 @@ int main(int argc, const char **argv)
     {
       ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
       if (ret < 0) {
-	std::cerr << "couldn't set up ioctx! error " << ret << std::endl;
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+	output_lock.unlock();
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
-	std::cerr << "we just created an ioctx for our pool" << std::endl;
+	output_lock.lock();
+	std::cerr THREAD_ID << "we just created an ioctx for our pool" << std::endl;
+	output_lock.unlock();
       }
     }
 
@@ -332,25 +421,53 @@ int main(int argc, const char **argv)
       bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
       blq.push(bl);
     }
+    blq_last_size = blq.size();
     blq_lock.unlock();
 
+    output_lock.lock();
+    std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
+	      << "\tCurrently there are " << blq_last_size << " buffers in the queue."
+	      << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
     // Get a stripe of bufferlists from the queue
 
     // the iteration loop begins here
     for (uint32_t j=0;j<iterations||failed;j++) {
       uint32_t index = 0;
+      while (blq_last_size < stripe_size) {
+	output_lock.lock();
+	std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
+		  << "Currently there are " << blq_last_size << " buffers in the queue."
+		  << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+	std::chrono::milliseconds duration(250);
+	std::this_thread::sleep_for(duration);
+	blq_lock.lock();
+	blq_last_size = blq.size();
+	blq_lock.unlock();
+      }
       for (uint32_t i=0;i<stripe_size;i++) {
 	index = j*stripe_size+i; // index == data.get_hash()
 	std::stringstream object_name;
 	object_name << obj_name << "." << index;
 	Stripe data(j,i,stripe_size,object_name.str());
 	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+	stripe_data_lock.lock();
 	stripe_data.insert(std::pair<uint32_t,Stripe>(data.get_hash(),data));
+	stripe_data_lock.unlock();
 	blq_lock.lock();
+	encoded_lock.lock();
 	encoded.insert( std::pair<uint32_t,bufferlist>(data.get_hash(),blq.front()));
+	encoded_lock.unlock();
 	blq.pop(); // remove the bl from the queue
 	blq_lock.unlock();
-	if(DEBUG>0) std::cerr << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	if(DEBUG>0) {
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	  output_lock.unlock();
+	}
 	write_completion_lock.lock();
 	write_completion.insert( 
 				std::pair<uint32_t,
@@ -361,47 +478,64 @@ int main(int argc, const char **argv)
       }
 
       FINISH_TIMER; // Compute total time since START_TIMER
-      std::cerr << "Setup for write test using AIO." << std::endl;
+      std::cout << "Setup for write test using AIO." << std::endl;
       REPORT_TIMING; // Print out the benchmark for this test
 
       START_TIMER; // Code for the begin_time
       write_completion_lock.lock();
+      encoded_lock.lock();
 	try {
 	  cit = write_completion.find(j*stripe_size);
 	  it = encoded.find(j*stripe_size);
 	  if(cit==write_completion.end()||it==encoded.end()) {
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
+		      << index << "." << std::endl;
+	    output_lock.unlock();
 	    //   std::throw std::out_of_range;
 	  }
 	}
 	catch (std::out_of_range& e) {
-	  std::cerr << "Out of range error accessing stripe_data. At index "
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
 		    << index << "." << std::endl;
+	  output_lock.unlock();
 	  ret = -1;
 	}
 	for (it,cit; it!=encoded.end()||cit!=write_completion.end()||failed; 
 	     it++,cit++) {
+	  stripe_data_lock.lock();
 	  try {
 	    ret = io_ctx.aio_write_full(
 					stripe_data.find(index)->second.get_object_name(), 
 					cit->second, it->second);
 	  }
 	  catch (std::exception& e) {
-	    std::cerr << "Exception while writing object. "
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "Exception while writing object. "
 		      << cit->first << std::endl;
+	    output_lock.unlock();
 	    ret = -1;
 	  }
+	  stripe_data_lock.unlock();
 	  if (ret < 0) {
-	    std::cerr << "couldn't start write object! error at index "
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "couldn't start write object! error at index "
 		      << index << std::endl;
+	    output_lock.unlock();
 	    ret = EXIT_FAILURE;
 	    failed = true; 
 	    // We have had a failure, so do not execute any further, 
 	    //fall through.
 	  }
 	}
-	write_completion_lock.unlock(); // if there is a failure in
-	std::cerr << "The write_completion map length is " << write_completion.size()
+	output_lock.lock();
+	completions_that_remain = write_completion.size();
+	std::cerr THREAD_ID << "The write_completion map length is " << completions_that_remain
 	<< std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+	write_completion_lock.unlock(); // if there is a failure in
 	// the previous block, this will still work
 	pending_buffers_lock.lock();
 	for (it=encoded.begin();
@@ -409,32 +543,48 @@ int main(int argc, const char **argv)
 	  pending_buffers.insert(std::pair<uint32_t,
 				 bufferlist>(it->first,it->second));
 	}
-	pending_buffers_lock.unlock();
 	encoded.clear();
+	encoded_lock.unlock();
+	pending_buffers_lock.unlock();
+	output_lock.lock();
+	blq_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cerr << "Writing aio test. Iteration " << j << " Queue size "
+	std::cout << "Writing aio test. Iteration " << j << " Queue size "
 		  << blq.size() << std::endl;
 	REPORT_BENCHMARK; // Print out the benchmark for this test
+	blq_lock.unlock();
+	output_lock.unlock();
     }
     // Print out the stripe object hashes and clear the stripe_data map
+    stripe_data_lock.lock();
     if (DEBUG > 0) {
       for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
-	std::cerr << "Deleting Stripe object with hash value "
+	output_lock.lock();
+	std::cerr THREAD_ID << "Deleting Stripe object with hash value "
 		  << sit->second.get_hash() << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
       }
     }
     stripe_data.clear();
+    stripe_data_lock.unlock();
+    output_lock.lock();
+    std::cout.flush();
+    output_lock.unlock();
   }
 
   START_TIMER; // Code for the begin_time
+  rados_done = true;
   AioCompletionThread.join(); // Wait for completions to finish.
   rados.shutdown();
 
   ret = failed ? ret:EXIT_SUCCESS;
 
   FINISH_TIMER; // Compute total time since START_TIMER
-  std::cerr << "Cleanup." << std::endl;
+  output_lock.lock();
+  std::cout << "Cleanup." << std::endl;
   REPORT_TIMING; // Print out the elapsed time for this section
-  std::cerr << "Total run time " << total_run_time_ms << " ms" << std::endl;
+  std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
+  output_lock.unlock();
   return ret;
 }

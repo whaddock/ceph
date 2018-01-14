@@ -83,6 +83,7 @@ int ret = 0;
 uint32_t stripe_size = 0;
 uint32_t blq_last_size;
 uint32_t completions_that_remain = 0;
+uint32_t pending_buffers_that_remain = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
@@ -124,19 +125,23 @@ void handleAioCompletions() {
   std::cerr.flush();
   output_lock.unlock();
   write_completion_lock.unlock();
-  while (!rados_done&&!completion_done) {
+  while (!rados_done||!completion_done) {
     // wait for the request to complete, and check that it succeeded.
     output_lock.lock();
     std::cerr THREAD_ID  << "In handleAioCompletions() outer while loop." << std::endl;
     std::cerr.flush();
     output_lock.unlock();
     pending_buffers_lock.lock();
-    if(pending_buffers.size()>stripe_size) {
+    pending_buffers_that_remain = pending_buffers.size();
+    pending_buffers_lock.unlock();
+    if(pending_buffers_that_remain>stripe_size) {
       output_lock.lock();
-      std::cerr THREAD_ID  << "pending_buffers size > stripe_size" << std::endl;
+      std::cerr THREAD_ID  << "pending_buffers size > stripe_size " <<
+	pending_buffers_that_remain << std::endl;
       std::cerr.flush();
       output_lock.unlock();
       stripe_data_lock.lock();
+      pending_buffers_lock.lock();
       write_completion_lock.lock(); // Get a lock on the write_completion map
       blq_lock.lock(); // Get a lock on the bufferlist queue
       completions_that_remain = write_completion.size();
@@ -183,8 +188,13 @@ void handleAioCompletions() {
 		    << " cit " << cit->first << "it " << it->first
 		    << "sit " << sit->first << std::endl;
 	  output_lock.unlock();
+	  blq_lock.unlock(); // in case we exit
+	  pending_buffers_lock.unlock(); // in case we exit
+	  write_completion_lock.unlock(); // in case we exit
+	  stripe_data_lock.unlock(); // in case we exit
 	  ret = -1;
 	}
+	pending_buffers_that_remain = pending_buffers.size();
 	output_lock.lock();
 	std::cerr THREAD_ID << "cit: " << cit->first
 		  << " about to release AIOCompletion in handleAioCompletions()"
@@ -200,7 +210,7 @@ void handleAioCompletions() {
 	std::cerr THREAD_ID << "pbit: " << pbit->first
 			    << " pending buffer in handleAioCompletions()"
 			    << "pending_buffers size after push is "
-			    << pending_buffers.size()
+			    << pending_buffers_that_remain
 			    << std::endl;
 	std::cerr.flush();
 	std::cerr THREAD_ID << "cit: " <<cit->first
@@ -218,8 +228,6 @@ void handleAioCompletions() {
 			    << completions_that_remain << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
-	blq_lock.unlock(); // Release lock on the bufferlist queue
-	pending_buffers_lock.unlock();
 	if (DEBUG > 0) {
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "we wrote our object "
@@ -228,14 +236,17 @@ void handleAioCompletions() {
 	  std::cerr.flush();
 	  output_lock.unlock();
 	}
-	stripe_data_lock.unlock();
       }
+      blq_lock.unlock(); // Release lock on the bufferlist queue
       write_completion_lock.unlock(); // Release lock on the write_completion map
-      std::this_thread::yield();
+      pending_buffers_lock.unlock();
+      stripe_data_lock.unlock();
+      std::chrono::milliseconds duration(10);
+      std::this_thread::sleep_for(duration);
     }
-    std::chrono::milliseconds duration(25);
+    std::chrono::milliseconds duration(100);
     std::this_thread::sleep_for(duration);
-    if (rados_done&& completions_that_remain==0) completion_done = true;
+    if (rados_done && completions_that_remain==0) completion_done = true;
   }
 }
 
@@ -575,6 +586,8 @@ int main(int argc, const char **argv)
 
   START_TIMER; // Code for the begin_time
   rados_done = true;
+  std::chrono::milliseconds duration(1000);
+  std::this_thread::sleep_for(duration);
   AioCompletionThread.join(); // Wait for completions to finish.
   rados.shutdown();
 

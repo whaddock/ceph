@@ -88,7 +88,6 @@ uint32_t pending_buffers_that_remain = 0;
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
 std::mutex blq_lock;
-std::mutex encoded_lock;
 std::mutex pending_buffers_lock;
 std::mutex write_completion_lock;
 std::mutex stripe_data_lock;
@@ -115,6 +114,7 @@ void handleAioCompletions() {
     std::cerr.flush();
     output_lock.unlock();
   }
+  // Code from thread
   write_completion_lock.lock();
   completions_that_remain = write_completion.size();
   output_lock.lock();
@@ -134,16 +134,18 @@ void handleAioCompletions() {
     pending_buffers_lock.lock();
     pending_buffers_that_remain = pending_buffers.size();
     pending_buffers_lock.unlock();
-    if(pending_buffers_that_remain>stripe_size) {
+    if(pending_buffers_that_remain>stripe_size||rados_done) {
       output_lock.lock();
       std::cerr THREAD_ID  << "pending_buffers size > stripe_size " <<
 	pending_buffers_that_remain << std::endl;
       std::cerr.flush();
       output_lock.unlock();
+
       stripe_data_lock.lock();
       pending_buffers_lock.lock();
       write_completion_lock.lock(); // Get a lock on the write_completion map
       blq_lock.lock(); // Get a lock on the bufferlist queue
+
       completions_that_remain = write_completion.size();
       if (completions_that_remain > 0) {
 	cit=write_completion.begin();
@@ -237,6 +239,7 @@ void handleAioCompletions() {
 	  output_lock.unlock();
 	}
       }
+
       blq_lock.unlock(); // Release lock on the bufferlist queue
       write_completion_lock.unlock(); // Release lock on the write_completion map
       pending_buffers_lock.unlock();
@@ -248,6 +251,8 @@ void handleAioCompletions() {
     std::this_thread::sleep_for(duration);
     if (rados_done && completions_that_remain==0) completion_done = true;
   }
+  // End code from thread
+
 }
 
 
@@ -469,10 +474,9 @@ int main(int argc, const char **argv)
 	stripe_data.insert(std::pair<uint32_t,Stripe>(data.get_hash(),data));
 	stripe_data_lock.unlock();
 	blq_lock.lock();
-	encoded_lock.lock();
 	encoded.insert( std::pair<uint32_t,bufferlist>(data.get_hash(),blq.front()));
-	encoded_lock.unlock();
 	blq.pop(); // remove the bl from the queue
+	blq_last_size = blq.size();
 	blq_lock.unlock();
 	if(DEBUG>0) {
 	  output_lock.lock();
@@ -494,7 +498,6 @@ int main(int argc, const char **argv)
 
       START_TIMER; // Code for the begin_time
       write_completion_lock.lock();
-      encoded_lock.lock();
 	try {
 	  cit = write_completion.find(j*stripe_size);
 	  it = encoded.find(j*stripe_size);
@@ -537,7 +540,7 @@ int main(int argc, const char **argv)
 	    ret = EXIT_FAILURE;
 	    failed = true; 
 	    // We have had a failure, so do not execute any further, 
-	    //fall through.
+	    // fall through.
 	  }
 	}
 	output_lock.lock();
@@ -555,49 +558,38 @@ int main(int argc, const char **argv)
 				 bufferlist>(it->first,it->second));
 	}
 	encoded.clear();
-	encoded_lock.unlock();
 	pending_buffers_lock.unlock();
 	output_lock.lock();
-	blq_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
 	std::cout << "Writing aio test. Iteration " << j << " Queue size "
-		  << blq.size() << std::endl;
+		  << blq_last_size << std::endl;
 	REPORT_BENCHMARK; // Print out the benchmark for this test
-	blq_lock.unlock();
 	output_lock.unlock();
     }
-    // Print out the stripe object hashes and clear the stripe_data map
-    stripe_data_lock.lock();
-    if (DEBUG > 0) {
-      for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
-	output_lock.lock();
-	std::cerr THREAD_ID << "Deleting Stripe object with hash value "
-		  << sit->second.get_hash() << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-      }
-    }
-    stripe_data.clear();
-    stripe_data_lock.unlock();
-    output_lock.lock();
-    std::cout.flush();
-    output_lock.unlock();
   }
 
   START_TIMER; // Code for the begin_time
   rados_done = true;
-  std::chrono::milliseconds duration(1000);
-  std::this_thread::sleep_for(duration);
-  AioCompletionThread.join(); // Wait for completions to finish.
-  rados.shutdown();
 
+  AioCompletionThread.join(); // Wait for completions to finish.
+  // Locking not required after this point.
+  rados.shutdown();
   ret = failed ? ret:EXIT_SUCCESS;
 
+  // Print out the stripe object hashes and clear the stripe_data map
+  if (DEBUG > 0) {
+    for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
+      std::cerr THREAD_ID << "Deleting Stripe object with hash value "
+			  << sit->second.get_hash() << std::endl;
+      std::cerr.flush();
+    }
+  }
+  stripe_data.clear();
+  std::cout.flush();
+
   FINISH_TIMER; // Compute total time since START_TIMER
-  output_lock.lock();
   std::cout << "Cleanup." << std::endl;
   REPORT_TIMING; // Print out the elapsed time for this section
   std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
-  output_lock.unlock();
   return ret;
 }

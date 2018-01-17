@@ -1,7 +1,7 @@
 CXXFLAGS=-std=c++11 -I../../src/include  -I../../src
 CFLAGS=-I../../src/include
 LDFLAGS=-lrados -lradosstriper
-all: aio_write_test_queue aio_read_test_queue
+all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test machine_threads 
 
 librados_hello_world: hello_world.cc
 	g++ -g -c hello_world.cc -o hello_world.o $(CXXFLAGS)
@@ -35,6 +35,18 @@ aio_read_test_queue: rados_aio_read_test_queue.cc
 	g++ -g -c rados_aio_read_test_queue.cc -o rados_aio_read_test_queue.o $(CXXFLAGS)
 	g++ -g rados_aio_read_test_queue.o  -o rados_aio_read_test_queue $(LDFLAGS)
 
+rados_threaded_write_test: rados_threaded_write_test.cc
+	g++ -g -c rados_threaded_write_test.cc -o rados_threaded_write_test.o $(CXXFLAGS)
+	g++ -g rados_threaded_write_test.o  -o rados_threaded_write_test $(LDFLAGS)
+
+rados_threaded_read_test: rados_threaded_read_test.cc
+	g++ -g -c rados_threaded_read_test.cc -o rados_threaded_read_test.o $(CXXFLAGS)
+	g++ -g rados_threaded_read_test.o  -o rados_threaded_read_test $(LDFLAGS)
+
+machine_threads: machine_threads.cc
+	g++ -g -c machine_threads.cc -o machine_threads.o $(CXXFLAGS)
+	g++ -g machine_threads.o  -o machine_threads $(LDFLAGS)
+
 clean:
 	rm hello_world.o librados_hello_world
 	rm hello_world_c.o librados_hello_world_c
@@ -44,3 +56,6 @@ clean:
 	rm rados_aio_write_test.o rados_aio_write_test
 	rm rados_aio_write_test_queue.o rados_aio_write_test_queue
 	rm rados_aio_read_test_queue.o rados_aio_read_test_queue
+	rm rados_threaded_write_test.o rados_threaded_write_test
+	rm rados_threaded_read_test.o rados_threaded_read_test
+	rm machine_threads.o machine_threads

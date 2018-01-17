@@ -87,14 +87,11 @@ const std::chrono::milliseconds duration(10);
 std::queue<librados::bufferlist> blq;
 std::map<uint32_t,bufferlist> encoded, pending_buffers;
 std::map<uint32_t,bufferlist>::iterator it,pbit;
-std::map<uint32_t,librados::AioCompletion*> write_completion;
-std::map<uint32_t,librados::AioCompletion*>::iterator cit;
 std::map<uint32_t,Stripe> stripe_data;
 std::map<uint32_t,Stripe>::iterator sit;
 bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
-bool completion_done = false; //Becomes true at the end when we all completions are safe
+bool reading_done = false; //Becomes true at the end when we all completions are safe
 uint32_t blq_last_size;
-uint32_t completions_that_remain = 0;
 uint32_t pending_buffers_that_remain = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
@@ -115,9 +112,9 @@ std::mutex stripe_data_lock;
  * program execution to wait until the completion_q is empty, i.e, all of the
  * objects are safe on disk.
  * @rados_done means that the main thread has finished writing shards/objects.
- * @completion_done means that the rados has finished writing shards/objects.
+ * @reading_done means that the rados has finished writing shards/objects.
  */
-void radosWriteThread() {
+void radosReadThread() {
   bool started = false;
   int ret;
   // For this thread
@@ -219,14 +216,14 @@ void radosWriteThread() {
       }
     }
   }
-  // Write loop 
-  while (!rados_done||!completion_done) {
+  // Read loop 
+  while (!rados_done||!reading_done) {
     // wait for the request to complete, and check that it succeeded.
     output_lock.lock();
-    std::cerr THREAD_ID  << "In radosWriteThread() outer while loop." << std::endl;
+    std::cerr THREAD_ID  << "In radosReadThread() outer while loop." << std::endl;
     std::cerr.flush();
     output_lock.unlock();
-    bufferlist _bl; // Local pointer to the selected bufferlist to write
+    bufferlist _bl; // Local pointer to the selected bufferlist to read
     Stripe _data; // Local pointer to the stripe data for the buffer
     pending_buffers_lock.lock();
     pending_buffers_that_remain = pending_buffers.size();
@@ -250,7 +247,7 @@ void radosWriteThread() {
 
       output_lock.lock();
       std::cerr THREAD_ID << "index: " << _data.get_hash()
-			  << " pending buffer erased in radosWriteThread()"
+			  << " pending buffer erased in radosReadThread()"
 			  << std::endl;
       output_lock.unlock();
 
@@ -262,7 +259,7 @@ void radosWriteThread() {
       continue;
     }
     try {
-      ret = io_ctx.write_full(_data.get_object_name(),_bl);
+      ret = io_ctx.read(_data.get_object_name(),_bl,object_size,0);
     }
     catch (std::exception& e) {
       output_lock.lock();
@@ -273,7 +270,7 @@ void radosWriteThread() {
     }
     if (ret < 0) {
       output_lock.lock();
-      std::cerr THREAD_ID << "couldn't start write object! error at index "
+      std::cerr THREAD_ID << "couldn't start read object! error at index "
 			  << _data.get_hash() << std::endl;
       output_lock.unlock();
       ret = EXIT_FAILURE;
@@ -288,14 +285,14 @@ void radosWriteThread() {
       blq.push(_bl);
       blq_lock.unlock(); // in case we exit
       output_lock.lock();
-      std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosWriteThread()"
+      std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosReadThread()"
 			  << std::endl;
       output_lock.unlock();
     }
     catch (std::out_of_range& e) {
       output_lock.lock();
       std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
-			  << "in rados write thread " THREAD_ID
+			  << "in rados read thread " THREAD_ID
 			  << std::endl;
       output_lock.unlock();
       blq_lock.unlock(); // in case we exit
@@ -306,7 +303,7 @@ void radosWriteThread() {
     pending_buffers_lock.unlock();
     output_lock.lock();
     std::cerr THREAD_ID << "pbit: " << _data.get_hash()
-			<< " pending buffer in radosWriteThread() "
+			<< " pending buffer in radosReadThread() "
 			<< "pending_buffers size after push is "
 			<< pending_buffers_that_remain
 			<< std::endl;
@@ -323,11 +320,11 @@ void radosWriteThread() {
     if (pending_buffers_that_remain > RADOS_THREADS) {
       std::this_thread::sleep_for(duration);
     }
-    if (rados_done && pending_buffers_that_remain==0) completion_done = true;
+    if (rados_done && pending_buffers_that_remain==0) reading_done = true;
   }
   // End code from thread
 
-  // End Write loop
+  // End Read loop
  out:
   rados.shutdown();
   ret = failed ? ret:EXIT_SUCCESS;
@@ -377,17 +374,17 @@ int main(int argc, const char **argv)
   _argc = argc;
   _argv = argv;
 
-  // Start the radosWriteThread
-  std::vector<std::thread> rados_write_threads;
+  // Start the radosReadThread
+  std::vector<std::thread> rados_read_threads;
   for (uint32_t i=0;i<RADOS_THREADS;i++) {
-    rados_write_threads.push_back(std::thread (radosWriteThread));
+    rados_read_threads.push_back(std::thread (radosReadThread));
   }
 
-  // RADOS AIO Write Test Here
+  // RADOS AIO Read Test Here
   /*
-   * now let's write the objects! Just for fun, we'll do it using
+   * now let's read the objects! Just for fun, we'll do it using
    * async IO instead of synchronous. 
-   * Here we do write all of the objects and then wait for completion
+   * Here we do read all of the objects and then wait for completion
    * after they have been dispatched.
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    * We create a queue of bufferlists so we can reuse them.
@@ -452,7 +449,7 @@ int main(int argc, const char **argv)
       // The encoded map is used by the erasure coding interface.
 
       FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Setup for write test using AIO." << std::endl;
+      std::cout << "Setup for read test using AIO." << std::endl;
       REPORT_TIMING; // Print out the benchmark for this test
 
       START_TIMER; // Code for the begin_time
@@ -497,12 +494,12 @@ int main(int argc, const char **argv)
   // Code from thread
 
   std::vector<std::thread>::iterator rit;
-  for (rit=rados_write_threads.begin();rit!=rados_write_threads.end();rit++) {
-    rit->join(); // Wait for writer to finish.
+  for (rit=rados_read_threads.begin();rit!=rados_read_threads.end();rit++) {
+    rit->join(); // Wait for readr to finish.
   }
 
   // Locking not required after this point.
-  std::cerr << "Wait for all writes to flush." << std::endl;
+  std::cerr << "Wait for all reads to flush." << std::endl;
   std::cerr.flush();
 
   // Print out the stripe object hashes and clear the stripe_data map

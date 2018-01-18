@@ -128,21 +128,27 @@ void radosWriteThread() {
 
   if(!started) {
     started = true;
+#ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Starting handleAioCompletions()" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
+#endif
     ret = rados.init("admin"); // just use the client.admin keyring
     if (ret < 0) { // let's handle any error that might have come back
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
       output_lock.unlock();
+#endif
       ret = EXIT_FAILURE;
       goto out;
     } else {
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
       output_lock.unlock();
+#endif
     }
 
     /*
@@ -154,15 +160,19 @@ void radosWriteThread() {
       ret = rados.conf_parse_argv(_argc, _argv);
       if (ret < 0) {
 	// This really can't happen, but we need to check to be a good citizen.
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
 	output_lock.unlock();
+#endif
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
 	output_lock.unlock();
+#endif
 	// We also want to apply the config file if the user specified
 	// one, and conf_parse_argv won't do that for us.
 	for (int i = 0; i < _argc; ++i) {
@@ -170,10 +180,12 @@ void radosWriteThread() {
 	    ret = rados.conf_read_file(_argv[i+1]);
 	    if (ret < 0) {
 	      // This could fail if the config file is malformed, but it'd be hard.
+#ifdef TRACE
 	      output_lock.lock();
 	      std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
 				  << "! error" << ret << std::endl;
 	      output_lock.unlock();
+#endif
 	      ret = EXIT_FAILURE;
 	      goto out;
 	    }
@@ -189,15 +201,19 @@ void radosWriteThread() {
     {
       ret = rados.connect();
       if (ret < 0) {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
 	output_lock.unlock();
+#endif
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
 	output_lock.unlock();
+#endif
       }
     }
 
@@ -207,52 +223,64 @@ void radosWriteThread() {
     {
       ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
       if (ret < 0) {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
 	output_lock.unlock();
+#endif
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "we just created an ioctx for our pool" << std::endl;
 	output_lock.unlock();
+#endif
       }
     }
   }
   // Write loop 
   while (!rados_done||!completion_done) {
     // wait for the request to complete, and check that it succeeded.
+#ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID  << "In radosWriteThread() outer while loop." << std::endl;
     std::cerr.flush();
     output_lock.unlock();
+#endif
     bufferlist _bl; // Local pointer to the selected bufferlist to write
     Stripe _data; // Local pointer to the stripe data for the buffer
     pending_buffers_lock.lock();
     pending_buffers_that_remain = pending_buffers.size();
+#ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID  << "pending_buffers size > stripe_size " <<
       pending_buffers_that_remain << std::endl;
     std::cerr.flush();
     output_lock.unlock();
+#endif
 
     pbit = pending_buffers.begin();
     if (pbit != pending_buffers.end()) {
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID  << "Writing " << pbit->first 
 			   << " to storage." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
+#endif
       stripe_data_lock.lock();
       _data = stripe_data[pbit->first];
       _bl = pbit->second;
       pending_buffers.erase(pbit);
 
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "index: " << _data.get_hash()
 			  << " pending buffer erased in radosWriteThread()"
 			  << std::endl;
       output_lock.unlock();
+#endif
 
       stripe_data_lock.unlock();
       pending_buffers_lock.unlock();
@@ -265,17 +293,22 @@ void radosWriteThread() {
       ret = io_ctx.write_full(_data.get_object_name(),_bl);
     }
     catch (std::exception& e) {
+
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "Exception while writing object. "
 			  << _data.get_object_name() << std::endl;
       output_lock.unlock();
+#endif
       ret = -1;
     }
     if (ret < 0) {
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "couldn't start write object! error at index "
 			  << _data.get_hash() << std::endl;
       output_lock.unlock();
+#endif
       ret = EXIT_FAILURE;
       failed = true; 
       goto out;
@@ -287,39 +320,40 @@ void radosWriteThread() {
       blq_lock.lock();
       blq.push(_bl);
       blq_lock.unlock(); // in case we exit
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosWriteThread()"
 			  << std::endl;
       output_lock.unlock();
+#endif
     }
     catch (std::out_of_range& e) {
+#ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
 			  << "in rados write thread " THREAD_ID
 			  << std::endl;
       output_lock.unlock();
+#endif
       blq_lock.unlock(); // in case we exit
       ret = -1;
     }
     pending_buffers_lock.lock();
     pending_buffers_that_remain = pending_buffers.size();
     pending_buffers_lock.unlock();
+#ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "pbit: " << _data.get_hash()
 			<< " pending buffer in radosWriteThread() "
 			<< "pending_buffers size after push is "
 			<< pending_buffers_that_remain
 			<< std::endl;
+    std::cerr THREAD_ID << "we wrote our object "
+			<< _data.get_object_name() 
+			<< std::endl;
     std::cerr.flush();
     output_lock.unlock();
-    if (DEBUG > 0) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "we wrote our object "
-			  << _data.get_object_name() 
-			  << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-    }
+#endif
     if (pending_buffers_that_remain > RADOS_THREADS) {
       std::this_thread::sleep_for(duration);
     }
@@ -340,7 +374,7 @@ int main(int argc, const char **argv)
   if(argc < 7)
     {
       output_lock.lock();
-      std::cerr THREAD_ID <<"Please put in correct params\n"<<
+      std::cout THREAD_ID <<"Please put in correct params\n"<<
 	"Iterations:\n"<<
 	"Stripe Size (Number of shards):\n" <<
 	"Queue Size:\n" <<
@@ -365,12 +399,12 @@ int main(int argc, const char **argv)
 
   START_TIMER; // Code for the begin_time
   output_lock.lock();
-  std::cerr THREAD_ID << "Iterations = " << iterations << std::endl;
-  std::cerr THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
-  std::cerr THREAD_ID << "Queue Size = " << queue_size << std::endl;
-  std::cerr THREAD_ID << "Object Size = " << object_size << std::endl;
-  std::cerr THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
-  std::cerr THREAD_ID << "Pool Name = " << pool_name << std::endl;
+  std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
+  std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
+  std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
+  std::cout THREAD_ID << "Object Size = " << object_size << std::endl;
+  std::cout THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
+  std::cout THREAD_ID << "Pool Name = " << pool_name << std::endl;
   output_lock.unlock();
 
   // store the program inputs in the global vars for access by threads
@@ -404,24 +438,28 @@ int main(int argc, const char **argv)
     blq_last_size = blq.size();
     blq_lock.unlock();
 
+#ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
 	      << "\tCurrently there are " << blq_last_size << " buffers in the queue."
 	      << std::endl;
     std::cerr.flush();
     output_lock.unlock();
+#endif
     // Get a stripe of bufferlists from the queue
 
     // the iteration loop begins here
     for (uint32_t j=0;j<iterations||failed;j++) {
       uint32_t index = 0;
       while (blq_last_size < stripe_size) {
+#ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
 		  << "Currently there are " << blq_last_size << " buffers in the queue."
 		  << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
+#endif
 	std::chrono::milliseconds duration(25);
 	std::this_thread::sleep_for(duration);
 	blq_lock.lock();
@@ -442,11 +480,11 @@ int main(int argc, const char **argv)
 	blq.pop(); // remove the bl from the queue
 	blq_last_size = blq.size();
 	blq_lock.unlock();
-	if(DEBUG>0) {
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
-	  output_lock.unlock();
-	}
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	output_lock.unlock();
+#endif
       }
 
       // The encoded map is used by the erasure coding interface.
@@ -459,18 +497,22 @@ int main(int argc, const char **argv)
 	try {
 	  it = encoded.find(j*stripe_size);
 	  if(it==encoded.end()) {
+#ifdef TRACE
 	    output_lock.lock();
 	    std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
 		      << index << "." << std::endl;
 	    output_lock.unlock();
+#endif
 	    //   std::throw std::out_of_range;
 	  }
 	}
 	catch (std::out_of_range& e) {
+#ifdef TRACE
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
 		    << index << "." << std::endl;
 	  output_lock.unlock();
+#endif
 	  ret = -1;
 	}
 	// the previous block, this will still work
@@ -506,13 +548,15 @@ int main(int argc, const char **argv)
   std::cerr.flush();
 
   // Print out the stripe object hashes and clear the stripe_data map
-  if (DEBUG > 0) {
+#ifdef TRACE
+  {
     for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
       std::cerr THREAD_ID << "Deleting Stripe object with hash value "
 			  << sit->second.get_hash() << std::endl;
       std::cerr.flush();
     }
   }
+#endif
   stripe_data.clear();
   std::cout.flush();
 

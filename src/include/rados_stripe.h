@@ -4,12 +4,12 @@
 // Class to hold stripe record
 class Stripe {
  public:
-  uint32_t stripe;
-  uint32_t shard;
-  uint32_t stripe_size;
+  int stripe;
+  int shard;
+  int stripe_size;
   std::string object_name;
 
-  Stripe(uint32_t _stripe, uint32_t _shard, uint32_t _stripe_size,
+  Stripe(int _stripe, int _shard, int _stripe_size,
 	std::string _object_name) 
     : stripe (_stripe), shard (_shard), stripe_size (_stripe_size),
       object_name (_object_name) {};
@@ -17,19 +17,19 @@ class Stripe {
   Stripe() {};
   ~Stripe() {};
 
-  uint32_t get_stripe() {
+  int get_stripe() {
     return this->stripe;
   }
-  uint32_t get_shard() {
+  int get_shard() {
     return this->shard;
   }
-  uint32_t get_hash() {
+  int get_hash() {
     return Stripe::compute_hash(this->shard,this->stripe,this->stripe_size);
   }
   std::string get_object_name() {
     return object_name;
   }
-  static uint32_t compute_hash(uint32_t _i,uint32_t _j, uint32_t _stripe_size) {
+  static int compute_hash(int _i,int _j, int _stripe_size) {
     return _j*_stripe_size+_i;
   }
 };

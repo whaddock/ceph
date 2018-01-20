@@ -10,7 +10,7 @@ noinst_HEADERS += \
 ceph_erasure_code_benchmark_SOURCES = \
 	erasure-code/ErasureCode.cc \
 	test/erasure-code/ceph_erasure_code_benchmark.cc
-ceph_erasure_code_benchmark_LDADD = $(LIBOSD) $(LIBCOMMON) $(BOOST_PROGRAM_OPTIONS_LIBS) $(CEPH_GLOBAL)
+ceph_erasure_code_benchmark_LDADD = $(LIBOSD) $(LIBCOMMON) $(BOOST_PROGRAM_OPTIONS_LIBS) $(CEPH_GLOBAL) -lrados
 if LINUX
 ceph_erasure_code_benchmark_LDADD += -ldl
 endif

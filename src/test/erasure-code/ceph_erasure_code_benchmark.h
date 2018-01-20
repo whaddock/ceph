@@ -29,9 +29,9 @@ public:
   int erasures;
   int k;
   int m;
-  uint32_t stripe_size;
-  uint32_t queue_size;
-  uint32_t object_size;
+  int stripe_size;
+  int queue_size;
+  int object_size;
   string obj_name;
   string pool_name;
   string plugin;

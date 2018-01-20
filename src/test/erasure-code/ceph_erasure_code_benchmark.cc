@@ -50,7 +50,7 @@
 #include "include/rados_stripe.h"
 
 #define DEBUG 1
-#define RADOS_THREADS 40
+#define RADOS_THREADS 0
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock(); \
@@ -62,32 +62,35 @@
 #define POOL_NAME "hello_world_pool_1"
 
 // Globals for program
-uint32_t iterations = 0;
-uint32_t stripe_size = 0;
-uint32_t queue_size = 0;
-uint32_t object_size = 0;
+int iterations = 0;
+int stripe_size = 0;
+int queue_size = 0;
+int object_size = 0;
 std::string obj_name;
 std::string pool_name;
 int ret = 0;
 bool failed = false; // Used as a flag to indicate that a failure has occurred
+int rados = 1; // Enable extended rados benchmarks. If false, only original erasure code benchmarks.
 int _argc; // Global argc for threads to use
 const char** _argv; // Global argv for threads to use
 const std::chrono::milliseconds duration(10);
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::map<int,bufferlist> encoded, pending_buffers;
-std::map<uint32_t,bufferlist>::iterator it,pbit;
-std::map<uint32_t,librados::AioCompletion*> write_completion;
-std::map<uint32_t,librados::AioCompletion*>::iterator cit;
-std::map<uint32_t,Stripe> stripe_data;
-std::map<uint32_t,Stripe>::iterator sit;
+std::map<int,bufferlist> encoded;
+std::map<int,bufferlist>::iterator it;
+std::map<int,bufferlist> pending_buffers;
+std::map<int,bufferlist>::iterator pbit;
+std::map<int,librados::AioCompletion*> write_completion;
+std::map<int,librados::AioCompletion*>::iterator cit;
+std::map<int,Stripe> stripe_data;
+std::map<int,Stripe>::iterator sit;
 bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
 bool completion_done = false; //Becomes true at the end when we all completions are safe
-uint32_t blq_last_size;
-uint32_t completions_that_remain = 0;
-uint32_t pending_buffers_that_remain = 0;
-uint32_t rados_threads = 0;
+int blq_last_size;
+int completions_that_remain = 0;
+int pending_buffers_that_remain = 0;
+int rados_threads = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
@@ -364,6 +367,8 @@ void radosWriteThread() {
 namespace po = boost::program_options;
 
 int ErasureCodeBench::setup(int argc, const char** argv) {
+  std::cerr << "Entering ErasureCodeBench::setup()" << std::endl;
+  std::cerr.flush();
 
   po::options_description desc("Allowed options");
   desc.add_options()
@@ -371,16 +376,30 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     ("verbose,v", "explain what happens")
     ("name,n", po::value<string>()->default_value("test"),
      "Prefix of object name: i.e. test123")
+    ;
+  std::cerr << "Added help,verbose,name" << std::endl;
+  std::cerr.flush();
+  desc.add_options()
+    ("rados,r", po::value<int>()->default_value(1),
+     "Enables rados benchmarks. If false, original EC benchmarks.")
     ("size,s", po::value<int>()->default_value(1024 * 1024),
      "size of the buffer to be encoded")
     ("threads,t", po::value<int>()->default_value(RADOS_THREADS),
      "Number of reader/writer threads to run.")
+    ;
+  std::cerr << "Added rados,size,threads" << std::endl;
+  std::cerr.flush();
+  desc.add_options()
     ("queuesize,q", po::value<int>()->default_value(1024),
      "size of the buffer queue")
     ("object_size,x", po::value<int>()->default_value(1024 * 1024 * 8),
      "size of the objects/shards to be encoded")
     ("iterations,i", po::value<int>()->default_value(1),
      "number of encode/decode runs")
+    ;
+  std::cerr << "Added queuesize,object_size,iterations" << std::endl;
+  std::cerr.flush();
+  desc.add_options()
     ("pool,y", po::value<string>()->default_value("stripe"),
      "pool name")
     ("plugin,p", po::value<string>()->default_value("jerasure"),
@@ -389,6 +408,10 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
      "run either encode or decode")
     ("erasures,e", po::value<int>()->default_value(1),
      "number of erasures when decoding")
+    ;
+  std::cerr << "Added pool,plugin,workload,erasures" << std::endl;
+  std::cerr.flush();
+  desc.add_options()
     ("erased", po::value<vector<int> >(),
      "erased chunk (repeat if more than one chunk is erased)")
     ("erasures-generation,E", po::value<string>()->default_value("random"),
@@ -399,6 +422,9 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     ("parameter,P", po::value<vector<string> >(),
      "add a parameter to the erasure code profile")
     ;
+  std::cerr << "Added erased,erased chunk,parameter" << std::endl;
+  std::cerr.flush();
+
 
   po::variables_map vm;
   po::parsed_options parsed =
@@ -407,15 +433,27 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     parsed,
     vm);
   po::notify(vm);
+  std::cerr << "Returned from parser" << std::endl;
+  std::cerr.flush();
 
   vector<const char *> ceph_options, def_args;
   vector<string> ceph_option_strings = po::collect_unrecognized(
     parsed.options, po::include_positional);
+  std::cerr << "Returned from po::collect_unrecognized. " << ceph_option_strings.size() << std::endl;
+  std::cerr.flush();
+
   ceph_options.reserve(ceph_option_strings.size());
+  std::cerr << "Returned from ceph_options.reserve()" << std::endl;
+  std::cerr.flush();
+
   for (vector<string>::iterator i = ceph_option_strings.begin();
        i != ceph_option_strings.end();
        ++i) {
+    std::cerr << "Pushing " << i->c_str() << std::endl;
+    std::cerr.flush();
     ceph_options.push_back(i->c_str());
+  std::cerr << "Returned from ceph_options. End of init function." << std::endl;
+  std::cerr.flush();
   }
 
   cct = global_init(
@@ -446,9 +484,10 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   }
 
   in_size = vm["size"].as<int>();
-  rados_threads = vm["threads"].as<uint32_t>();
-  queue_size = vm["queue"].as<uint32_t>();
-  object_size = vm["object_size"].as<uint32_t>();
+  rados = vm["size"].as<int>();
+  rados_threads = vm["threads"].as<int>();
+  queue_size = vm["queue"].as<int>();
+  object_size = vm["object_size"].as<int>();
   max_iterations = vm["iterations"].as<int>();
   obj_name = vm["name"].as<string>();
   pool_name = vm["pool"].as<string>();
@@ -713,127 +752,127 @@ int main(int argc, const char** argv) {
     cerr THREAD_ID << e.what() << endl; 
     return 1;
   }
+  if (rados == 0) {
+    iterations = ecbench.max_iterations;
+    stripe_size = ecbench.k + ecbench.m;
+    queue_size = ecbench.queue_size;
+    object_size = ecbench.object_size;
+    obj_name = ecbench.obj_name;
+    pool_name = ecbench.pool_name;
 
-  iterations = ecbench.max_iterations;
-  stripe_size = ecbench.k + ecbench.m;
-  queue_size = ecbench.queue_size;
-  object_size = ecbench.object_size;
-  obj_name = ecbench.obj_name;
-  pool_name = ecbench.pool_name;
+    // variables used for timing
+    std::clock_t end_time;
+    std::clock_t begin_time;
+    std::clock_t total_time_ms = 0;
+    std::clock_t total_run_time_ms = 0;
 
-  // variables used for timing
-  std::clock_t end_time;
-  std::clock_t begin_time;
-  std::clock_t total_time_ms = 0;
-  std::clock_t total_run_time_ms = 0;
-
-  START_TIMER; // Code for the begin_time
-  std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
-  std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
-  std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
-  std::cout THREAD_ID << "Object Size = " << object_size << std::endl;
-  std::cout THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
-  std::cout THREAD_ID << "Pool Name = " << pool_name << std::endl;
-
-  // store the program inputs in the global vars for access by threads
-  _argc = argc;
-  _argv = argv;
-
-  // Start the radosWriteThread
-  std::vector<std::thread> rados_write_threads;
-  for (uint32_t i=0;i<RADOS_THREADS;i++) {
-    rados_write_threads.push_back(std::thread (radosWriteThread));
-  }
-
-  // RADOS AIO Write Test Here
-  /*
-   * now let's write the objects! Just for fun, we'll do it using
-   * async IO instead of synchronous. 
-   * Here we do write all of the objects and then wait for completion
-   * after they have been dispatched.
-   * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
-   * We create a queue of bufferlists so we can reuse them.
-   * We iterate over the procedure writing stripes of data.
-   */
-  {
     START_TIMER; // Code for the begin_time
-    blq_lock.lock(); // It's OK here, just starting up
-    for (uint32_t i=0;i<queue_size;i++) {
-      librados::bufferlist bl;
-      bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
-      blq.push(bl);
+    std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
+    std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
+    std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
+    std::cout THREAD_ID << "Object Size = " << object_size << std::endl;
+    std::cout THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
+    std::cout THREAD_ID << "Pool Name = " << pool_name << std::endl;
+
+    // store the program inputs in the global vars for access by threads
+    _argc = argc;
+    _argv = argv;
+
+    // Start the radosWriteThread
+    std::vector<std::thread> rados_write_threads;
+    for (int i=0;i<RADOS_THREADS;i++) {
+      rados_write_threads.push_back(std::thread (radosWriteThread));
     }
-    blq_last_size = blq.size();
-    blq_lock.unlock();
 
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
-	      << "\tCurrently there are " << blq_last_size << " buffers in the queue."
-	      << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    // Get a stripe of bufferlists from the queue
-
-    // the iteration loop begins here
-    for (uint32_t j=0;j<iterations||failed;j++) {
-      uint32_t index = 0;
-      while (blq_last_size < stripe_size) {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
-		  << "Currently there are " << blq_last_size << " buffers in the queue."
-		  << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	std::chrono::milliseconds duration(25);
-	std::this_thread::sleep_for(duration);
-	blq_lock.lock();
-	blq_last_size = blq.size();
-	blq_lock.unlock();
+    // RADOS AIO Write Test Here
+    /*
+     * now let's write the objects! Just for fun, we'll do it using
+     * async IO instead of synchronous. 
+     * Here we do write all of the objects and then wait for completion
+     * after they have been dispatched.
+     * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
+     * We create a queue of bufferlists so we can reuse them.
+     * We iterate over the procedure writing stripes of data.
+     */
+    {
+      START_TIMER; // Code for the begin_time
+      blq_lock.lock(); // It's OK here, just starting up
+      for (int i=0;i<queue_size;i++) {
+	librados::bufferlist bl;
+	bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
+	blq.push(bl);
       }
-      for (uint32_t i=0;i<stripe_size;i++) {
-	index = j*stripe_size+i; // index == data.get_hash()
-	std::stringstream object_name;
-	object_name << obj_name << "." << index;
-	Stripe data(j,i,stripe_size,object_name.str());
-	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
-	stripe_data_lock.lock();
-	stripe_data.insert(std::pair<uint32_t,Stripe>(data.get_hash(),data));
-	stripe_data_lock.unlock();
-	blq_lock.lock();
-	encoded.insert( std::pair<int,bufferlist>((int)data.get_hash(),blq.front()));
-	blq.pop(); // remove the bl from the queue
-	blq_last_size = blq.size();
-	blq_lock.unlock();
+      blq_last_size = blq.size();
+      blq_lock.unlock();
+
 #ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
-	output_lock.unlock();
+      output_lock.lock();
+      std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
+			  << "\tCurrently there are " << blq_last_size << " buffers in the queue."
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
 #endif
-      }
+      // Get a stripe of bufferlists from the queue
 
-      FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Setup for write test using AIO." << std::endl;
-      REPORT_TIMING; // Print out the benchmark for this test
+      // the iteration loop begins here
+      for (int j=0;j<iterations||failed;j++) {
+	int index = 0;
+	while (blq_last_size < stripe_size) {
+#ifdef TRACE
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
+			      << "Currently there are " << blq_last_size << " buffers in the queue."
+			      << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+#endif
+	  std::chrono::milliseconds duration(25);
+	  std::this_thread::sleep_for(duration);
+	  blq_lock.lock();
+	  blq_last_size = blq.size();
+	  blq_lock.unlock();
+	}
+	for (int i=0;i<stripe_size;i++) {
+	  index = j*stripe_size+i; // index == data.get_hash()
+	  std::stringstream object_name;
+	  object_name << obj_name << "." << index;
+	  Stripe data(j,i,stripe_size,object_name.str());
+	  assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+	  stripe_data_lock.lock();
+	  stripe_data.insert(std::pair<int,Stripe>(data.get_hash(),data));
+	  stripe_data_lock.unlock();
+	  blq_lock.lock();
+	  encoded.insert( std::pair<int,bufferlist>((int)data.get_hash(),blq.front()));
+	  blq.pop(); // remove the bl from the queue
+	  blq_last_size = blq.size();
+	  blq_lock.unlock();
+#ifdef TRACE
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	  output_lock.unlock();
+#endif
+	}
 
-      // The encoded map is used by the erasure coding interface.
-      START_TIMER; // Code for the begin_time of encoding
-      ret = ecbench.encode(&encoded);
-      FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Encoding time." << std::endl;
-      REPORT_TIMING; // Print out time
+	FINISH_TIMER; // Compute total time since START_TIMER
+	std::cout << "Setup for write test using AIO." << std::endl;
+	REPORT_TIMING; // Print out the benchmark for this test
 
-      START_TIMER; // Code for the begin_time to put the chunks in the write queue
+	// The encoded map is used by the erasure coding interface.
+	START_TIMER; // Code for the begin_time of encoding
+	ret = ecbench.encode(&encoded);
+	FINISH_TIMER; // Compute total time since START_TIMER
+	std::cout << "Encoding time." << std::endl;
+	REPORT_TIMING; // Print out time
+
+	START_TIMER; // Code for the begin_time to put the chunks in the write queue
 	try {
 	  it = encoded.find(j*stripe_size);
 	  if(it==encoded.end()) {
 #ifdef TRACE
 	    output_lock.lock();
 	    std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
-		      << index << "." << std::endl;
+				<< index << "." << std::endl;
 	    output_lock.unlock();
 #endif
 	    //   std::throw std::out_of_range;
@@ -843,7 +882,7 @@ int main(int argc, const char** argv) {
 #ifdef TRACE
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
-		    << index << "." << std::endl;
+			      << index << "." << std::endl;
 	  output_lock.unlock();
 #endif
 	  ret = -1;
@@ -852,7 +891,7 @@ int main(int argc, const char** argv) {
 	pending_buffers_lock.lock();
 	for (it=encoded.begin();
 	     it!=encoded.end()||failed; it++) {
-	  pending_buffers.insert(std::pair<uint32_t,
+	  pending_buffers.insert(std::pair<int,
 				 bufferlist>(it->first,it->second));
 	}
 	encoded.clear();
@@ -863,40 +902,43 @@ int main(int argc, const char** argv) {
 		  << blq_last_size << std::endl;
 	REPORT_BENCHMARK; // Print out the benchmark for this test
 	output_lock.unlock();
+      }
     }
-  }
 
-  START_TIMER; // Code for the begin_time
-  rados_done = true;
+    START_TIMER; // Code for the begin_time
+    rados_done = true;
 
-  // Code from thread
+    // Code from thread
 
-  std::vector<std::thread>::iterator rit;
-  for (rit=rados_write_threads.begin();rit!=rados_write_threads.end();rit++) {
-    rit->join(); // Wait for writer to finish.
-  }
+    std::vector<std::thread>::iterator rit;
+    for (rit=rados_write_threads.begin();rit!=rados_write_threads.end();rit++) {
+      rit->join(); // Wait for writer to finish.
+    }
 
-  // Locking not required after this point.
-  std::cerr << "Wait for all writes to flush." << std::endl;
-  std::cerr.flush();
+    // Locking not required after this point.
+    std::cerr << "Wait for all writes to flush." << std::endl;
+    std::cerr.flush();
 
-  // Print out the stripe object hashes and clear the stripe_data map
+    // Print out the stripe object hashes and clear the stripe_data map
 #ifdef TRACE
-  {
-    for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
-      std::cerr THREAD_ID << "Deleting Stripe object with hash value "
-			  << sit->second.get_hash() << std::endl;
-      std::cerr.flush();
+    {
+      for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
+	std::cerr THREAD_ID << "Deleting Stripe object with hash value "
+			    << sit->second.get_hash() << std::endl;
+	std::cerr.flush();
+      }
     }
-  }
 #endif
-  stripe_data.clear();
-  std::cout.flush();
+    stripe_data.clear();
+    std::cout.flush();
 
-  FINISH_TIMER; // Compute total time since START_TIMER
-  std::cout << "Cleanup." << std::endl;
-  REPORT_TIMING; // Print out the elapsed time for this section
-  std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
+    FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Cleanup." << std::endl;
+    REPORT_TIMING; // Print out the elapsed time for this section
+    std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
+  } else {
+    ecbench.run();
+  }
 }
 
 /*

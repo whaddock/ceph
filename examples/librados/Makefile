@@ -1,7 +1,49 @@
-CXXFLAGS=-std=c++11 -I../../src/include  -I../../src
-CFLAGS=-I../../src/include
-LDFLAGS=-lrados -lradosstriper
-all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test machine_threads 
+ceph_src = ../../src
+ceph_libs = $(ceph_src)/.libs
+CXXFLAGS=-std=c++11 -I$(ceph_src)/include  -I$(ceph_src)
+CFLAGS=-I$(ceph_src)/include
+LDFLAGS=-L/lib64 -L$(ceph_src) -L$(ceph_libs) -lrados -lradosstriper
+
+ceph_erasure_code_benchmark_LDADD =  \
+        $(LIBOSD) $(LIBCOMMON) \
+        $(BOOST_PROGRAM_OPTIONS_LIBS) \
+        $(CEPH_GLOBAL) \
+        $(LIBERASURE_CODE) \
+        $(am__append_175)
+
+am__append_175 = -ldl
+CEPH_GLOBAL = $(LIBGLOBAL) $(LIBCOMMON) $(PTHREAD_LIBS) -lm $(CRYPTO_LIBS) $(EXTRALIBS)
+BOOST_PROGRAM_OPTIONS_LIBS = -lboost_program_options-mt 
+LIBGLOBAL = $(ceph_libs)/libglobal.a
+LIBCOMMON = $(ceph_libs)/libcommon.a -luuid
+LIBOSD = $(ceph_src)/libosd.a $(am__append_23) $(LIBOSDC) $(LIBOS) $(LIBPERFGLUE) \
+        $(LIBOSD_TYPES) $(LIBOS_TYPES)
+LIBOSD_TYPES = $(ceph_libs)/libosd_types.a
+PTHREAD_LIBS =  -lpthread
+CRYPTO_LIBS = -lssl3 -lsmime3 -lnss3 -lnssutil3 -lplds4 -lplc4 -lnspr4 -lpthread -ldl  
+EXTRALIBS = -lm $(am__append_14) $(am__append_15) $(am__append_16) \
+        $(am__append_27)
+#am__append_23 = -ljemalloc
+LIBOSDC = $(ceph_libs)/libosdc.a
+LIBOS = $(ceph_src)/libos.a $(am__append_17) $(am__append_18) $(am__append_19) \
+        $(LIBOS_TYPES) $(LIBKV) $(LIBFUSE_LIBS)
+LIBOS_TYPES = $(ceph_src)/libos_types.a
+LIBPERFGLUE = $(ceph_libs)/libperfglue.a $(am__append_20) $(am__append_21)
+#am__append_14 = -lexecinfo
+am__append_15 = -lrt
+#am__append_16 = -lprofiler
+#am__append_27 = -lgcov
+LIBKV = $(ceph_src)/libkv.a $(am__append_28) $(am__append_29) $(am__append_30) -lz \
+        -lleveldb -lsnappy
+LIBFUSE_LIBS = -pthread -lfuse  
+#am__append_20 = -ltcmalloc_minimal
+am__append_21 = -ltcmalloc
+am__append_28 = $(ceph_src)/rocksdb/librocksdb.a
+am__append_29 = -lbz2
+#am__append_30 = -llz4
+LIBERASURE_CODE = $(ceph_libs)/liberasure_code.a
+
+all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test rados_threaded_ec_write_test machine_threads 
 
 librados_hello_world: hello_world.cc
 	g++ -g -c hello_world.cc -o hello_world.o $(CXXFLAGS)
@@ -39,6 +81,12 @@ rados_threaded_write_test: rados_threaded_write_test.cc
 	g++ -g -c rados_threaded_write_test.cc -o rados_threaded_write_test.o $(CXXFLAGS)
 	g++ -g rados_threaded_write_test.o  -o rados_threaded_write_test $(LDFLAGS)
 
+rados_threaded_ec_write_test: rados_threaded_ec_write_test.cc
+	g++ -g -c rados_threaded_ec_write_test.cc -o rados_threaded_ec_write_test.o $(CXXFLAGS)
+	g++ -g rados_threaded_ec_write_test.o  -o rados_threaded_ec_write_test \
+ $(LDFLAGS) $(ceph_erasure_code_benchmark_LDADD)
+
+
 rados_threaded_read_test: rados_threaded_read_test.cc
 	g++ -g -c rados_threaded_read_test.cc -o rados_threaded_read_test.o $(CXXFLAGS)
 	g++ -g rados_threaded_read_test.o  -o rados_threaded_read_test $(LDFLAGS)
@@ -57,5 +105,6 @@ clean:
 	rm rados_aio_write_test_queue.o rados_aio_write_test_queue
 	rm rados_aio_read_test_queue.o rados_aio_read_test_queue
 	rm rados_threaded_write_test.o rados_threaded_write_test
+	rm rados_threaded_ec_write_test.o rados_threaded_ec_write_test
 	rm rados_threaded_read_test.o rados_threaded_read_test
 	rm machine_threads.o machine_threads

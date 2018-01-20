@@ -44,6 +44,7 @@
 #include "erasure-code/ErasureCodePlugin.h"
 #include "erasure-code/ErasureCode.h"
 #include "ceph_erasure_code_benchmark.h"
+#include "rados_stripe.h"
 
 namespace po = boost::program_options;
 // End From ceph_erasure_code_benchmark.cc
@@ -60,7 +61,41 @@ namespace po = boost::program_options;
   total_run_time_ms += total_time_ms;
 #define POOL_NAME "hello_world_pool_1"
 
-int ErasureCodeBench::setup(int argc, char** argv) {
+// Globals for program
+uint32_t iterations = 0;
+uint32_t stripe_size = 0;
+uint32_t queue_size = 0;
+uint32_t object_size = 0;
+std::string obj_name;
+std::string pool_name;
+int ret = 0;
+bool failed = false; // Used as a flag to indicate that a failure has occurred
+int _argc; // Global argc for threads to use
+const char** _argv; // Global argv for threads to use
+const std::chrono::milliseconds duration(10);
+
+// Create queues, maps and iterators used by the main and thread functions.
+std::queue<librados::bufferlist> blq;
+std::map<uint32_t,bufferlist> encoded, pending_buffers;
+std::map<uint32_t,bufferlist>::iterator it,pbit;
+std::map<uint32_t,librados::AioCompletion*> write_completion;
+std::map<uint32_t,librados::AioCompletion*>::iterator cit;
+std::map<uint32_t,Stripe> stripe_data;
+std::map<uint32_t,Stripe>::iterator sit;
+bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
+bool completion_done = false; //Becomes true at the end when we all completions are safe
+uint32_t blq_last_size;
+uint32_t completions_that_remain = 0;
+uint32_t pending_buffers_that_remain = 0;
+
+// Locks for containers sharee with the handleAioCompletions thread.
+std::mutex output_lock;
+std::mutex blq_lock;
+std::mutex pending_buffers_lock;
+std::mutex write_completion_lock;
+std::mutex stripe_data_lock;
+
+int ErasureCodeBench::setup(int argc, const char** argv) {
 
   po::options_description desc("Allowed options");
   desc.add_options()
@@ -70,8 +105,16 @@ int ErasureCodeBench::setup(int argc, char** argv) {
      "Prefix of object name: i.e. test123")
     ("size,s", po::value<int>()->default_value(1024 * 1024),
      "size of the buffer to be encoded")
+    ("threads,t", po::value<int>()->default_value(40),
+     "Number of reader/writer threads to run.")
+    ("queuesize,q", po::value<int>()->default_value(1024),
+     "size of the buffer queue")
+    ("object_size,x", po::value<int>()->default_value(1024 * 1024 * 8),
+     "size of the objects/shards to be encoded")
     ("iterations,i", po::value<int>()->default_value(1),
      "number of encode/decode runs")
+    ("pool,y", po::value<string>()->default_value("stripe"),
+     "pool name")
     ("plugin,p", po::value<string>()->default_value("jerasure"),
      "erasure code plugin name")
     ("workload,w", po::value<string>()->default_value("encode"),
@@ -135,7 +178,12 @@ int ErasureCodeBench::setup(int argc, char** argv) {
   }
 
   in_size = vm["size"].as<int>();
+  threads = vm["size"].as<uint32_t>();
+  queue_size = vm["queue"].as<uint32_t>();
+  object_size = vm["object_size"].as<uint32_t>();
   max_iterations = vm["iterations"].as<int>();
+  obj_name = vm["name"].as<string>();
+  pool_name = vm["pool"].as<string>();
   plugin = vm["plugin"].as<string>();
   workload = vm["workload"].as<string>();
   erasures = vm["erasures"].as<int>();
@@ -149,7 +197,7 @@ int ErasureCodeBench::setup(int argc, char** argv) {
 
   k = atoi(profile["k"].c_str());
   m = atoi(profile["m"].c_str());
-  
+  stripe_size = k + m;
   if (k <= 0) {
     cout << "parameter k is " << k << ". But k needs to be > 0." << endl;
     return -EINVAL;
@@ -351,73 +399,6 @@ int ErasureCodeBench::decode()
   cout << (end_time - begin_time) << "\t" << (max_iterations * (in_size / 1024)) << endl;
   return 0;
 }
-
-// Class to hold stripe record
-class Stripe {
- public:
-  uint32_t stripe;
-  uint32_t shard;
-  uint32_t stripe_size;
-  std::string object_name;
-
-  Stripe(uint32_t _stripe, uint32_t _shard, uint32_t _stripe_size,
-	std::string _object_name) 
-    : stripe (_stripe), shard (_shard), stripe_size (_stripe_size),
-      object_name (_object_name) {};
-
-  Stripe() {};
-  ~Stripe() {};
-
-  uint32_t get_stripe() {
-    return this->stripe;
-  }
-  uint32_t get_shard() {
-    return this->shard;
-  }
-  uint32_t get_hash() {
-    return Stripe::compute_hash(this->shard,this->stripe,this->stripe_size);
-  }
-  std::string get_object_name() {
-    return object_name;
-  }
-  static uint32_t compute_hash(uint32_t _i,uint32_t _j, uint32_t _stripe_size) {
-    return _j*_stripe_size+_i;
-  }
-};
-
-// Globals for program
-uint32_t iterations = 0;
-uint32_t stripe_size = 0;
-uint32_t queue_size = 0;
-uint32_t object_size = 0;
-std::string obj_name;
-std::string pool_name;
-int ret = 0;
-bool failed = false; // Used as a flag to indicate that a failure has occurred
-int _argc; // Global argc for threads to use
-const char** _argv; // Global argv for threads to use
-const std::chrono::milliseconds duration(10);
-
-// Create queues, maps and iterators used by the main and thread functions.
-std::queue<librados::bufferlist> blq;
-std::map<uint32_t,bufferlist> encoded, pending_buffers;
-std::map<uint32_t,bufferlist>::iterator it,pbit;
-std::map<uint32_t,librados::AioCompletion*> write_completion;
-std::map<uint32_t,librados::AioCompletion*>::iterator cit;
-std::map<uint32_t,Stripe> stripe_data;
-std::map<uint32_t,Stripe>::iterator sit;
-bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
-bool completion_done = false; //Becomes true at the end when we all completions are safe
-uint32_t blq_last_size;
-uint32_t completions_that_remain = 0;
-uint32_t pending_buffers_that_remain = 0;
-
-// Locks for containers sharee with the handleAioCompletions thread.
-std::mutex output_lock;
-std::mutex blq_lock;
-std::mutex pending_buffers_lock;
-std::mutex write_completion_lock;
-std::mutex stripe_data_lock;
 
 /* Function used by completion thread to handle completions. The main thread
  * pushes the AioCompletion* to the completion_q after the write operation
@@ -696,25 +677,12 @@ int main(int argc, const char **argv)
     return 1;
   }
 
-  if(argc < 7)
-    {
-      output_lock.lock();
-      std::cout THREAD_ID <<"Please put in correct params\n"<<
-	"Iterations:\n"<<
-	"Stripe Size (Number of shards):\n" <<
-	"Queue Size:\n" <<
-	"Object Size:\n" <<
-	"Object Name:\n" <<
-	"Pool Name:"<< std::endl;
-      output_lock.unlock();
-      return EXIT_FAILURE;
-    }
-  iterations = std::stoi(argv[1]);
-  stripe_size = std::stoi(argv[2]);
-  queue_size = std::stoi(argv[3]);
-  object_size = std::stoi(argv[4]);
-  obj_name = argv[5];
-  pool_name = argv[6];
+  iterations = ecbench.max_iterations;
+  stripe_size = ecbench.k + ecbench.m;
+  queue_size = ecbench.queue_size;
+  object_size = ecbench.object_size;
+  obj_name = ecbench.obj_name;
+  pool_name = ecbench.pool_name;
 
   // variables used for timing
   std::clock_t end_time;
@@ -738,7 +706,7 @@ int main(int argc, const char **argv)
 
   // Start the radosWriteThread
   std::vector<std::thread> rados_write_threads;
-  for (uint32_t i=0;i<RADOS_THREADS;i++) {
+  for (uint32_t i=0;i<rados_threads;i++) {
     rados_write_threads.push_back(std::thread (radosWriteThread));
   }
 

@@ -49,6 +49,7 @@
 #include <chrono>
 #include "include/rados_stripe.h"
 
+#define TRACE
 #define DEBUG 1
 #define RADOS_THREADS 0
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
@@ -349,7 +350,7 @@ void radosWriteThread() {
     std::cerr.flush();
     output_lock.unlock();
 #endif
-    if (pending_buffers_that_remain > RADOS_THREADS) {
+    if (pending_buffers_that_remain > rados_threads) {
       std::this_thread::sleep_for(duration);
     }
     if (rados_done && pending_buffers_that_remain==0) completion_done = true;
@@ -484,7 +485,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   }
 
   in_size = vm["size"].as<int>();
-  rados = vm["size"].as<int>();
+  rados = vm["rados"].as<int>();
   rados_threads = vm["threads"].as<int>();
   queue_size = vm["queuesize"].as<int>();
   object_size = vm["object_size"].as<int>(); 
@@ -780,7 +781,7 @@ int main(int argc, const char** argv) {
 
     // Start the radosWriteThread
     std::vector<std::thread> rados_write_threads;
-    for (int i=0;i<RADOS_THREADS;i++) {
+    for (int i=0;i<rados_threads;i++) {
       rados_write_threads.push_back(std::thread (radosWriteThread));
     }
 

@@ -515,6 +515,25 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
 
   verbose = vm.count("verbose") > 0 ? true : false;
 
+  ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
+  instance.disable_dlclose = true;
+  stringstream messages;
+  int code = instance.factory(plugin,
+			      g_conf->erasure_code_dir,
+			      profile, &erasure_code, &messages);
+  if (code) {
+    cerr << messages.str() << endl;
+    return code;
+  }
+  if (erasure_code->get_data_chunk_count() != (unsigned int)k ||
+      (erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count()
+       != (unsigned int)m)) {
+    cout << "parameter k is " << k << "/m is " << m << ". But data chunk count is "
+      << erasure_code->get_data_chunk_count() <<"/parity chunk count is "
+      << erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count() << endl;
+    return -EINVAL;
+  }
+
   return 0;
 }
 
@@ -530,26 +549,6 @@ int ErasureCodeBench::run() {
 
 int ErasureCodeBench::encode()
 {
-  ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
-  ErasureCodeInterfaceRef erasure_code;
-  stringstream messages;
-  int code = instance.factory(plugin,
-			      g_conf->erasure_code_dir,
-			      profile, &erasure_code, &messages);
-  if (code) {
-    cerr << messages.str() << endl;
-    return code;
-  }
-
-  if (erasure_code->get_data_chunk_count() != (unsigned int)k ||
-      (erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count()
-       != (unsigned int)m)) {
-    cout << "parameter k is " << k << "/m is " << m << ". But data chunk count is "
-      << erasure_code->get_data_chunk_count() <<"/parity chunk count is "
-      << erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count() << endl;
-    return -EINVAL;
-  }
-
   bufferlist in;
   in.append(string(in_size, 'X'));
   in.rebuild_aligned(ErasureCode::SIMD_ALIGN);
@@ -560,7 +559,7 @@ int ErasureCodeBench::encode()
   utime_t begin_time = ceph_clock_now(g_ceph_context);
   for (int i = 0; i < max_iterations; i++) {
     map<int,bufferlist> encoded;
-    code = erasure_code->encode(want_to_encode, in, &encoded);
+    int code = erasure_code->encode(want_to_encode, in, &encoded);
     if (code)
       return code;
   }
@@ -571,31 +570,12 @@ int ErasureCodeBench::encode()
 
 int ErasureCodeBench::encode(map<int, bufferlist> *encoded)
 {
-  ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
-  ErasureCodeInterfaceRef erasure_code;
-  stringstream messages;
-  int code = instance.factory(plugin,
-			      g_conf->erasure_code_dir,
-			      profile, &erasure_code, &messages);
-  if (code) {
-    cerr << messages.str() << endl;
-    return code;
-  }
-
-  if (erasure_code->get_data_chunk_count() != (unsigned int)k ||
-      (erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count()
-       != (unsigned int)m)) {
-    cout << "parameter k is " << k << "/m is " << m << ". But data chunk count is "
-      << erasure_code->get_data_chunk_count() <<"/parity chunk count is "
-      << erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count() << endl;
-    return -EINVAL;
-  }
   set<int> want_to_encode;
   for (int i = 0; i < k + m; i++) {
     want_to_encode.insert(i);
   }
   utime_t begin_time = ceph_clock_now(g_ceph_context);
-  code = erasure_code->encode_chunks(want_to_encode,encoded);
+  int code = erasure_code->encode_chunks(want_to_encode,encoded);
   if (code)
     return code;
   utime_t end_time = ceph_clock_now(g_ceph_context);
@@ -668,24 +648,6 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
 
 int ErasureCodeBench::decode()
 {
-  ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
-  ErasureCodeInterfaceRef erasure_code;
-  stringstream messages;
-  int code = instance.factory(plugin,
-			      g_conf->erasure_code_dir,
-			      profile, &erasure_code, &messages);
-  if (code) {
-    cerr << messages.str() << endl;
-    return code;
-  }
-  if (erasure_code->get_data_chunk_count() != (unsigned int)k ||
-      (erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count()
-       != (unsigned int)m)) {
-    cout << "parameter k is " << k << "/m is " << m << ". But data chunk count is "
-      << erasure_code->get_data_chunk_count() <<"/parity chunk count is "
-      << erasure_code->get_chunk_count() - erasure_code->get_data_chunk_count() << endl;
-    return -EINVAL;
-  }
   bufferlist in;
   in.append(string(in_size, 'X'));
   in.rebuild_aligned(ErasureCode::SIMD_ALIGN);
@@ -696,7 +658,7 @@ int ErasureCodeBench::decode()
   }
 
   map<int,bufferlist> encoded;
-  code = erasure_code->encode(want_to_encode, in, &encoded);
+  int code = erasure_code->encode(want_to_encode, in, &encoded);
   if (code)
     return code;
 
@@ -898,7 +860,10 @@ int main(int argc, const char** argv) {
     std::cerr << "Wait for all writes to flush." << std::endl;
     std::cerr.flush();
     utime_t end_time_final = ceph_clock_now(g_ceph_context);
-    cout << (end_time_final - begin_time_final) << "\t" << (iterations * stripe_size * object_size / (1024*1024)) 
+    cout << "Factors for computing size: iterations: " << iterations
+	 << " stripe_size: " << stripe_size 
+	 << " object_size: " << object_size << std::endl;
+    cout << (end_time_final - begin_time_final) << "\t" << (iterations * stripe_size * object_size / 1024) 
     << endl;
 
     // Print out the stripe object hashes and clear the stripe_data map

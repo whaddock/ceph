@@ -41,6 +41,7 @@ public:
   string workload;
 
   ErasureCodeProfile profile;
+  ErasureCodeInterfaceRef erasure_code;
 
   bool verbose;
   boost::intrusive_ptr<CephContext> cct;

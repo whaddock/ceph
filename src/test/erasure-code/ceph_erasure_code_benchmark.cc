@@ -49,7 +49,6 @@
 #include <chrono>
 #include "include/rados_stripe.h"
 
-#define TRACE
 #define DEBUG 1
 #define RADOS_THREADS 0
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
@@ -600,7 +599,7 @@ int ErasureCodeBench::encode(map<int, bufferlist> *encoded)
   if (code)
     return code;
   utime_t end_time = ceph_clock_now(g_ceph_context);
-  cout << (end_time - begin_time) << "\t" << (max_iterations * (in_size / 1024)) << endl;
+  cout << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
   return 0;
 }
 
@@ -795,116 +794,95 @@ int main(int argc, const char** argv) {
      * We create a queue of bufferlists so we can reuse them.
      * We iterate over the procedure writing stripes of data.
      */
-    {
-      START_TIMER; // Code for the begin_time
-      blq_lock.lock(); // It's OK here, just starting up
-      for (int i=0;i<queue_size;i++) {
-	librados::bufferlist bl;
-	bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
-	blq.push(bl);
-      }
-      blq_last_size = blq.size();
-      blq_lock.unlock();
 
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
-			  << "\tCurrently there are " << blq_last_size << " buffers in the queue."
-			  << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
-      // Get a stripe of bufferlists from the queue
-
-      // the iteration loop begins here
-      for (int j=0;j<iterations||failed;j++) {
-	int index = 0;
-	while (blq_last_size < stripe_size) {
-#ifdef TRACE
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
-			      << "Currently there are " << blq_last_size << " buffers in the queue."
-			      << std::endl;
-	  std::cerr.flush();
-	  output_lock.unlock();
-#endif
-	  std::chrono::milliseconds duration(25);
-	  std::this_thread::sleep_for(duration);
-	  blq_lock.lock();
-	  blq_last_size = blq.size();
-	  blq_lock.unlock();
-	}
-	for (int i=0;i<stripe_size;i++) {
-	  index = j*stripe_size+i; // index == data.get_hash()
-	  std::stringstream object_name;
-	  object_name << obj_name << "." << index;
-	  Stripe data(j,i,stripe_size,object_name.str());
-	  assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
-	  stripe_data_lock.lock();
-	  stripe_data.insert(std::pair<int,Stripe>(data.get_hash(),data));
-	  stripe_data_lock.unlock();
-	  blq_lock.lock();
-	  encoded.insert( std::pair<int,bufferlist>((int)data.get_hash(),blq.front()));
-	  blq.pop(); // remove the bl from the queue
-	  blq_last_size = blq.size();
-	  blq_lock.unlock();
-#ifdef TRACE
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
-	  output_lock.unlock();
-#endif
-	}
-
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Setup for write test using AIO." << std::endl;
-	REPORT_TIMING; // Print out the benchmark for this test
-
-	// The encoded map is used by the erasure coding interface.
-	START_TIMER; // Code for the begin_time of encoding
-	ret = ecbench.encode(&encoded);
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Encoding time." << std::endl;
-	REPORT_TIMING; // Print out time
-
-	START_TIMER; // Code for the begin_time to put the chunks in the write queue
-	try {
-	  it = encoded.find(j*stripe_size);
-	  if(it==encoded.end()) {
-#ifdef TRACE
-	    output_lock.lock();
-	    std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
-				<< index << "." << std::endl;
-	    output_lock.unlock();
-#endif
-	    //   std::throw std::out_of_range;
-	  }
-	}
-	catch (std::out_of_range& e) {
-#ifdef TRACE
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Out of range error accessing stripe_data. At index "
-			      << index << "." << std::endl;
-	  output_lock.unlock();
-#endif
-	  ret = -1;
-	}
-	// the previous block, this will still work
-	pending_buffers_lock.lock();
-	for (it=encoded.begin();
-	     it!=encoded.end()||failed; it++) {
-	  pending_buffers.insert(std::pair<int,
-				 bufferlist>(it->first,it->second));
-	}
-	encoded.clear();
-	pending_buffers_lock.unlock();
-	output_lock.lock();
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Writing aio test. Iteration " << j << " Queue size "
-		  << blq_last_size << std::endl;
-	REPORT_BENCHMARK; // Print out the benchmark for this test
-	output_lock.unlock();
-      }
+    START_TIMER; // Code for the begin_time
+    blq_lock.lock(); // It's OK here, just starting up
+    for (int i=0;i<queue_size;i++) {
+      librados::bufferlist bl;
+      bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
+      blq.push(bl);
     }
+    blq_last_size = blq.size();
+    blq_lock.unlock();
+
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
+			<< "\tCurrently there are " << blq_last_size << " buffers in the queue."
+			<< std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+    // Get a stripe of bufferlists from the queue
+
+    // the iteration loop begins here
+    utime_t begin_time_final = ceph_clock_now(g_ceph_context);
+    for (int j=0;j<iterations||failed;j++) {
+      int index = 0;
+      while (blq_last_size < stripe_size) {
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
+			    << "Currently there are " << blq_last_size << " buffers in the queue."
+			    << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
+	std::chrono::milliseconds duration(25);
+	std::this_thread::sleep_for(duration);
+	blq_lock.lock();
+	blq_last_size = blq.size();
+	blq_lock.unlock();
+      }
+      for (int i=0;i<stripe_size;i++) {
+	index = j*stripe_size+i; // index == data.get_hash()
+	std::stringstream object_name;
+	object_name << obj_name << "." << index;
+	Stripe data(j,i,stripe_size,object_name.str());
+	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+	stripe_data_lock.lock();
+	stripe_data.insert(std::pair<int,Stripe>(data.get_hash(),data));
+	stripe_data_lock.unlock();
+	blq_lock.lock();
+	encoded.insert( std::pair<int,bufferlist>((int)data.get_shard(),blq.front()));
+	blq.pop(); // remove the bl from the queue
+	blq_last_size = blq.size();
+	blq_lock.unlock();
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	output_lock.unlock();
+#endif
+      }
+
+      FINISH_TIMER; // Compute total time since START_TIMER
+      std::cout << "Setup for write test using AIO." << std::endl;
+      REPORT_TIMING; // Print out the benchmark for this test
+
+      // The encoded map is used by the erasure coding interface.
+      START_TIMER; // Code for the begin_time of encoding
+      ret = ecbench.encode(&encoded);
+      FINISH_TIMER; // Compute total time since START_TIMER
+      std::cout << "Encoding time." << std::endl;
+      REPORT_TIMING; // Print out time
+
+      START_TIMER; // Code for the begin_time to put the chunks in the write queue
+      pending_buffers_lock.lock();
+      for (it=encoded.begin();
+	   it!=encoded.end(); it++) {
+	pending_buffers.insert(std::pair<int,
+			       bufferlist>(it->first+j*stripe_size,it->second));
+      }
+      encoded.clear();
+      pending_buffers_lock.unlock();
+      output_lock.lock();
+      FINISH_TIMER; // Compute total time since START_TIMER
+      std::cout << "Writing aio test. Iteration " << j << " Queue size "
+		<< blq_last_size << std::endl;
+      REPORT_BENCHMARK; // Print out the benchmark for this test
+      output_lock.unlock();
+    }
+
 
     START_TIMER; // Code for the begin_time
     rados_done = true;
@@ -919,6 +897,9 @@ int main(int argc, const char** argv) {
     // Locking not required after this point.
     std::cerr << "Wait for all writes to flush." << std::endl;
     std::cerr.flush();
+    utime_t end_time_final = ceph_clock_now(g_ceph_context);
+    cout << (end_time_final - begin_time_final) << "\t" << (iterations * stripe_size * object_size / (1024*1024)) 
+    << endl;
 
     // Print out the stripe object hashes and clear the stripe_data map
 #ifdef TRACE

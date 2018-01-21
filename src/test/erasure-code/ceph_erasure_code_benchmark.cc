@@ -375,17 +375,17 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     ("help,h", "produce help message")
     ("verbose,v", "explain what happens")
     ("name,n", po::value<string>()->default_value("test"),
-     "Prefix of object name: i.e. test123")
+	  "Prefix of object name: i.e. test123")
     ;
   std::cerr << "Added help,verbose,name" << std::endl;
   std::cerr.flush();
   desc.add_options()
     ("rados,r", po::value<int>()->default_value(1),
-     "Enables rados benchmarks. If false, original EC benchmarks.")
+     "Enables rados benchmarks. If false, original EC benchmarks.") 
     ("size,s", po::value<int>()->default_value(1024 * 1024),
      "size of the buffer to be encoded")
     ("threads,t", po::value<int>()->default_value(RADOS_THREADS),
-     "Number of reader/writer threads to run.")
+     "Number of reader/writer threads to run.") 
     ;
   std::cerr << "Added rados,size,threads" << std::endl;
   std::cerr.flush();
@@ -393,7 +393,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     ("queuesize,q", po::value<int>()->default_value(1024),
      "size of the buffer queue")
     ("object_size,x", po::value<int>()->default_value(1024 * 1024 * 8),
-     "size of the objects/shards to be encoded")
+     "size of the objects/shards to be encoded") 
     ("iterations,i", po::value<int>()->default_value(1),
      "number of encode/decode runs")
     ;
@@ -486,8 +486,8 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   in_size = vm["size"].as<int>();
   rados = vm["size"].as<int>();
   rados_threads = vm["threads"].as<int>();
-  queue_size = vm["queue"].as<int>();
-  object_size = vm["object_size"].as<int>();
+  queue_size = vm["queuesize"].as<int>();
+  object_size = vm["object_size"].as<int>(); 
   max_iterations = vm["iterations"].as<int>();
   obj_name = vm["name"].as<string>();
   pool_name = vm["pool"].as<string>();

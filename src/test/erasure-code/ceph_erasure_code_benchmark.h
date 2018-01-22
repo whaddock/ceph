@@ -52,6 +52,10 @@ public:
 		      unsigned i,
 		      unsigned want_erasures,
 		      ErasureCodeInterfaceRef erasure_code);
+  int decode_erasures(const map<int,bufferlist> &chunks,
+		      unsigned i,
+		      unsigned want_erasures,
+		      ErasureCodeInterfaceRef erasure_code);
   int decode();
   int encode();
   int encode(map<int, bufferlist> *encoded);

@@ -51,6 +51,8 @@
 
 #define DEBUG 1
 #define RADOS_THREADS 0
+#define BLQ_SLEEP_DURATION 25 // in millisecinds
+#define THREAD_SLEEP_DURATION 10 // in millisecinds
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock(); \
@@ -73,12 +75,14 @@ bool failed = false; // Used as a flag to indicate that a failure has occurred
 int rados = 1; // Enable extended rados benchmarks. If false, only original erasure code benchmarks.
 int _argc; // Global argc for threads to use
 const char** _argv; // Global argv for threads to use
-const std::chrono::milliseconds duration(10);
+const std::chrono::milliseconds thread_sleep_duration(THREAD_SLEEP_DURATION);
+const std::chrono::milliseconds blq_sleep_duration(BLQ_SLEEP_DURATION);
+
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::map<int,bufferlist> encoded;
-std::map<int,bufferlist>::iterator it;
+std::map<int,bufferlist> stripes;
+std::map<int,bufferlist>::iterator stripes_it;
 std::map<int,bufferlist> pending_buffers;
 std::map<int,bufferlist>::iterator pbit;
 std::map<int,librados::AioCompletion*> write_completion;
@@ -95,9 +99,86 @@ int num_rados_threads = 0;
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
 std::mutex blq_lock;
+std::mutex stripes_lock;
 std::mutex pending_buffers_lock;
 std::mutex write_completion_lock;
 std::mutex stripe_data_lock;
+
+/* Function used to perform erasure coding or repair. 
+ */
+
+void erasureCodeThread(ErasureCodeBench ecbench) {
+  bool started = false;
+  int ret, stripe_index;
+  Stripe shard;
+  map<int,bufferlist> encoded;
+  map<int,bufferlist>shard_it;
+
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting erasureCodeThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+
+  }
+
+  while (!rados_done) {
+    stripes_lock.lock();
+    stripes_it = stripes.begin();
+    if (stripes_it!=stripes.end()) {
+      encoded = stripes_it;
+      stripe_index = stripes_it->first; // stripe_index is the stripe number
+      stripes.erase(stripes_it);
+      stripes_lock.unlock();
+    } else {
+      stripes_lock.unlock();
+      std::this_thread::sleep_for(thread_sleep_duration);
+      continue;
+    }
+    if (ecbench.workload == "encode") {
+    ret = ecbench.encode(&encoded);
+    pending_buffers_lock.lock();
+    for (shard_it=encoded.begin();
+	 shard_it!=encoded.end(); shard_it++) {
+      pending_buffers.insert(std::pair<int,
+			     bufferlist>(stripe_index*ecbench.stripe_size+shard_it->first,shard_it->second));
+    }
+    encoded.clear();
+    pending_buffers_lock.unlock();
+    } else { // for reading, we have to wait until the shards are read
+      for (;shard_it!=encoded.end();
+	   shard_it++) {
+	index = stripe_index*ecbench.stripe_size+shard_it->first;
+	stripe_data_lock.lock();
+	shard = stripe_data.find(index);
+	stripe_data_lock.unlock();
+	while (!shard->is_read()) {
+	    std::this_thread::sleep_for(thread_sleep_duration);
+	    continue;
+	    // waits until all of the shards in the stripe have been read
+	}
+      }
+      ret = ecbench.decode(encoded);
+      /* here, the erasures have been repaired and the stripes are ready for use.
+       * For now, we're putting them back into the blq.
+       */
+      blq_lock.lock();
+      for (shard_it=encoded.begin();shard_it!=encoded.end();shard_it++) {
+	blq.push(shard_it->second);
+      }
+      encoded.erase();
+    }
+    if (ret < 0) {
+      output_lock.lock();
+      std::cerr << "Error in erasure code call to ecbench. " << ret << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+    }
+  }
+}
 
 /* Function used by completion thread to handle completions. The main thread
  * pushes the AioCompletion* to the completion_q after the write operation
@@ -125,7 +206,7 @@ void radosReadThread() {
     started = true;
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID << "Starting handleAioCompletions()" << std::endl;
+    std::cerr THREAD_ID << "Starting radosReadThread()" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -292,6 +373,8 @@ void radosReadThread() {
       goto out;
       // We have had a failure, so do not execute any further, 
       // fall through.
+    } else { // Flag this shard as having been read successfully
+      _data.set_read();
     }
 
     try {
@@ -336,7 +419,7 @@ void radosReadThread() {
       output_lock.unlock();
     }
     if (pending_buffers_that_remain > num_rados_threads) {
-      std::this_thread::sleep_for(duration);
+      std::this_thread::sleep_for(thread_sleep_duration);
     }
     if (rados_done && pending_buffers_that_remain==0) reading_done = true;
   }
@@ -376,7 +459,7 @@ void radosWriteThread() {
     started = true;
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID << "Starting handleAioCompletions()" << std::endl;
+    std::cerr THREAD_ID << "Starting radosWriteThread()" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -601,7 +684,7 @@ void radosWriteThread() {
     output_lock.unlock();
 #endif
     if (pending_buffers_that_remain > num_rados_threads) {
-      std::this_thread::sleep_for(duration);
+      std::this_thread::sleep_for(blq_sleep_duration);
     }
     if (rados_done && pending_buffers_that_remain==0) completion_done = true;
   }
@@ -897,26 +980,19 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
   return 0;
 }
 
-int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &chunks,
-				      unsigned i,
-				      unsigned want_erasures,
-				      ErasureCodeInterfaceRef erasure_code)
+int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &chunks)
 {
-  if (want_erasures == 0) {
-    if (verbose)
-      display_chunks(chunks, erasure_code->get_chunk_count());
-    set<int> want_to_read;
-    for (unsigned int chunk = 0; chunk < erasure_code->get_chunk_count(); chunk++)
-      if (chunks.count(chunk) == 0)
-	want_to_read.insert(chunk);
+  if (verbose)
+    display_chunks(chunks, erasure_code->get_chunk_count());
+  set<int> want_to_read;
+  for (unsigned int chunk = 0; chunk < erasure_code->get_chunk_count(); chunk++)
+    if (chunks.count(chunk) == 0)
+      want_to_read.insert(chunk);
 
-    map<int,bufferlist> decoded;
-    code = erasure_code->decode(want_to_read, chunks, &decoded);
-    if (code)
-      return code;
-    return 0;
-  }
-
+  map<int,bufferlist> decoded;
+  int code = erasure_code->decode(want_to_read, chunks, &decoded);
+  if (code)
+    return code;
   return 0;
 }
 
@@ -1023,7 +1099,7 @@ int main(int argc, const char** argv) {
     } else {
       std::vector<std::thread> rados_threads;
       for (int i=0;i<num_rados_threads;i++) {
-	rados_threads.push_back(std::thread (radosWriteThread));
+	rados_threads.push_back(std::thread (radosReadThread));
       }
     }
 
@@ -1068,13 +1144,14 @@ int main(int argc, const char** argv) {
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	std::chrono::milliseconds duration(25);
-	std::this_thread::sleep_for(duration);
+	std::this_thread::sleep_for(blq_sleep);
 	blq_lock.lock();
 	blq_last_size = blq.size();
 	blq_lock.unlock();
       }
-      if (ecbench.workload == "encode") {
+      std::map<int,bufferlist>::iterator it;
+      std::map<int,bufferlist> encoded;
+      if (ecbench.workload == "encode") { // Begin Write procedure
 	for (int i=0;i<stripe_size;i++) {
 	  index = j*stripe_size+i; // index == data.get_hash()
 	  std::stringstream object_name;
@@ -1102,28 +1179,25 @@ int main(int argc, const char** argv) {
 
 	// The encoded map is used by the erasure coding interface.
 	START_TIMER; // Code for the begin_time of encoding
-	ret = ecbench.encode(&encoded);
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Encoding time." << std::endl;
-	REPORT_TIMING; // Print out time
 
-	START_TIMER; // Code for the begin_time to put the chunks in the write queue
-	pending_buffers_lock.lock();
-	for (it=encoded.begin();
-	     it!=encoded.end(); it++) {
-	  pending_buffers.insert(std::pair<int,
-				 bufferlist>(it->first+j*stripe_size,it->second));
-	}
-	encoded.clear();
-	pending_buffers_lock.unlock();
+	/* Push the encoded map into a queue for the threads to 
+	 * read. When the shards have been read, the map is pushed
+	 * to the finished queue. For now, the threads empty the
+	 * map and put the buffers back into the blq. In a real
+	 * system, the data would be sent to the user.
+	 */
+	stripeq_lock.lock();
+	stripeq.push(encoded);
+	stripeq_lock.unlock();
+
 	output_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
 	std::cout << "Writing aio test. Iteration " << j << " Queue size "
 		  << blq_last_size << std::endl;
 	REPORT_BENCHMARK; // Print out the benchmark for this test
 	output_lock.unlock();
-      } else {
-      for (int i=0;i<stripe_size;i++) {
+      } else { // Begin Read procedure
+	for (int i=0;i<stripe_size;i++) {
 	index = j*stripe_size+i; // index == data.get_hash()
 	std::stringstream object_name;
 	object_name << obj_name << "." << index;
@@ -1137,6 +1211,12 @@ int main(int argc, const char** argv) {
 	blq.pop(); // remove the bl from the queue
 	blq_last_size = blq.size();
 	blq_lock.unlock();
+	// Erase the buffers that were prescribed by the input configuration
+	if (ecbench.erased.size() > 0) {
+	  for (vector<int>::const_iterator i = ecbench.erased.begin();
+	       i != ecbench.erased.end();i++) 
+	    encoded.erase(*i);
+	}
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
@@ -1154,20 +1234,20 @@ int main(int argc, const char** argv) {
 	pending_buffers_lock.lock();
 	for (it=encoded.begin();
 	     it!=encoded.end(); it++) {
-	  // skip over reading the number of erasures specified.
-	  if (it->first >= ecbench.erasures) {
-	    pending_buffers.insert(std::pair<int,
-				   bufferlist>(it->first,it->second));
-	  }
+	  pending_buffers.insert(std::pair<int,
+				 bufferlist>(it->first,it->second));
 	}
 	pending_buffers_lock.unlock();
-	output_lock.lock();
 	/* Push the encoded map into a queue for the threads to 
 	 * read. When the shards have been read, the map is pushed
 	 * to the finished queue. For now, the threads empty the
 	 * map and put the buffers back into the blq. In a real
 	 * system, the data would be sent to the user.
 	 */
+	stripeq_lock.lock();
+	stripeq.push(encoded);
+	stripeq_lock.unlock();
+	output_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
 	std::cout << "Writing aio test. Iteration " << j << " Queue size "
 		  << blq_last_size << std::endl;

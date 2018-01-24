@@ -81,16 +81,16 @@ const std::chrono::milliseconds blq_sleep_duration(BLQ_SLEEP_DURATION);
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::map<int,bufferlist> stripes;
-std::map<int,bufferlist>::iterator stripes_it;
+std::map<int,map<int,bufferlist>> stripes;
+std::map<int,map<int,bufferlist>>::iterator stripes_it;
 std::map<int,bufferlist> pending_buffers;
 std::map<int,bufferlist>::iterator pbit;
 std::map<int,librados::AioCompletion*> write_completion;
 std::map<int,librados::AioCompletion*>::iterator cit;
 std::map<int,Stripe> stripe_data;
 std::map<int,Stripe>::iterator sit;
+std::vector<std::thread> rados_threads;
 bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
-bool completion_done = false; //Becomes true at the end when we all completions are safe
 int blq_last_size;
 int completions_that_remain = 0;
 int pending_buffers_that_remain = 0;
@@ -109,10 +109,10 @@ std::mutex stripe_data_lock;
 
 void erasureCodeThread(ErasureCodeBench ecbench) {
   bool started = false;
-  int ret, stripe_index;
+  int ret, index, stripe_index, _stripe_size;
   Stripe shard;
   map<int,bufferlist> encoded;
-  map<int,bufferlist>shard_it;
+  map<int,bufferlist>::iterator shard_it;
 
   if(!started) {
     started = true;
@@ -129,7 +129,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
     stripes_lock.lock();
     stripes_it = stripes.begin();
     if (stripes_it!=stripes.end()) {
-      encoded = stripes_it;
+      encoded = stripes_it->second;
       stripe_index = stripes_it->first; // stripe_index is the stripe number
       stripes.erase(stripes_it);
       stripes_lock.unlock();
@@ -149,19 +149,21 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
     encoded.clear();
     pending_buffers_lock.unlock();
     } else { // for reading, we have to wait until the shards are read
-      for (;shard_it!=encoded.end();
+      for (shard_it=encoded.begin();
+	   shard_it!=encoded.end();
 	   shard_it++) {
-	index = stripe_index*ecbench.stripe_size+shard_it->first;
+	_stripe_size = ecbench.stripe_size;
+	index = stripe_index * _stripe_size + shard_it->first;
 	stripe_data_lock.lock();
-	shard = stripe_data.find(index);
+	shard = stripe_data.find(index)->second;
 	stripe_data_lock.unlock();
-	while (!shard->is_read()) {
+	while (!shard.is_read()) {
 	    std::this_thread::sleep_for(thread_sleep_duration);
 	    continue;
 	    // waits until all of the shards in the stripe have been read
 	}
       }
-      ret = ecbench.decode(encoded);
+      ret = ecbench.decode_erasures(encoded);
       /* here, the erasures have been repaired and the stripes are ready for use.
        * For now, we're putting them back into the blq.
        */
@@ -169,7 +171,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
       for (shard_it=encoded.begin();shard_it!=encoded.end();shard_it++) {
 	blq.push(shard_it->second);
       }
-      encoded.erase();
+      encoded.clear();
     }
     if (ret < 0) {
       output_lock.lock();
@@ -194,6 +196,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
  * @reading_done means that the rados has finished writing shards/objects.
  */
 void radosReadThread() {
+  bool reading_done = false; //Becomes true at the end when we all completions are safe
   bool started = false;
   int ret;
   // For this thread
@@ -444,9 +447,10 @@ void radosReadThread() {
  * program execution to wait until the completion_q is empty, i.e, all of the
  * objects are safe on disk.
  * @rados_done means that the main thread has finished writing shards/objects.
- * @completion_done means that the rados has finished writing shards/objects.
+ * @writing_done means that the rados has finished writing shards/objects.
  */
 void radosWriteThread() {
+  bool writing_done = false; //Becomes true at the end when we all completions are safe
   bool started = false;
   int ret;
   // For this thread
@@ -569,7 +573,7 @@ void radosWriteThread() {
     }
   }
   // Write loop 
-  while (!rados_done||!completion_done) {
+  while (!rados_done||!writing_done) {
     // wait for the request to complete, and check that it succeeded.
 #ifdef TRACE
     output_lock.lock();
@@ -686,7 +690,7 @@ void radosWriteThread() {
     if (pending_buffers_that_remain > num_rados_threads) {
       std::this_thread::sleep_for(blq_sleep_duration);
     }
-    if (rados_done && pending_buffers_that_remain==0) completion_done = true;
+    if (rados_done && pending_buffers_that_remain==0) writing_done = true;
   }
   // End code from thread
 
@@ -1092,16 +1096,17 @@ int main(int argc, const char** argv) {
 
     // Start the radosWriteThread
     if (ecbench.workload == "encode") {
-      std::vector<std::thread> rados_threads;
       for (int i=0;i<num_rados_threads;i++) {
 	rados_threads.push_back(std::thread (radosWriteThread));
       }
     } else {
-      std::vector<std::thread> rados_threads;
       for (int i=0;i<num_rados_threads;i++) {
 	rados_threads.push_back(std::thread (radosReadThread));
       }
     }
+
+    // Start the erasureCodeThread
+    std::thread ecThread = std::thread (erasureCodeThread, ecbench);
 
     // RADOS IO Test Here
     /*
@@ -1144,7 +1149,7 @@ int main(int argc, const char** argv) {
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	std::this_thread::sleep_for(blq_sleep);
+	std::this_thread::sleep_for(blq_sleep_duration);
 	blq_lock.lock();
 	blq_last_size = blq.size();
 	blq_lock.unlock();
@@ -1186,9 +1191,9 @@ int main(int argc, const char** argv) {
 	 * map and put the buffers back into the blq. In a real
 	 * system, the data would be sent to the user.
 	 */
-	stripeq_lock.lock();
-	stripeq.push(encoded);
-	stripeq_lock.unlock();
+	stripes_lock.lock();
+	stripes.insert(std::pair<int,std::map<int,bufferlist>>(j,encoded));
+	stripes_lock.unlock();
 
 	output_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
@@ -1244,9 +1249,9 @@ int main(int argc, const char** argv) {
 	 * map and put the buffers back into the blq. In a real
 	 * system, the data would be sent to the user.
 	 */
-	stripeq_lock.lock();
-	stripeq.push(encoded);
-	stripeq_lock.unlock();
+	stripes_lock.lock();
+	stripes.insert(std::pair<int,std::map<int,bufferlist>>(j,encoded));
+	stripes_lock.unlock();
 	output_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
 	std::cout << "Writing aio test. Iteration " << j << " Queue size "

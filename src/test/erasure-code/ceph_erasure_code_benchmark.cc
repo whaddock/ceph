@@ -49,6 +49,7 @@
 #include <chrono>
 #include "include/rados_stripe.h"
 
+#define TRACE
 #define DEBUG 1
 #define RADOS_THREADS 0
 #define BLQ_SLEEP_DURATION 25 // in millisecinds
@@ -85,8 +86,6 @@ std::map<int,map<int,bufferlist>> stripes;
 std::map<int,map<int,bufferlist>>::iterator stripes_it;
 std::map<int,bufferlist> pending_buffers;
 std::map<int,bufferlist>::iterator pbit;
-std::map<int,librados::AioCompletion*> write_completion;
-std::map<int,librados::AioCompletion*>::iterator cit;
 std::map<int,Stripe> stripe_data;
 std::map<int,Stripe>::iterator sit;
 std::vector<std::thread> rados_threads;
@@ -101,13 +100,13 @@ std::mutex output_lock;
 std::mutex blq_lock;
 std::mutex stripes_lock;
 std::mutex pending_buffers_lock;
-std::mutex write_completion_lock;
 std::mutex stripe_data_lock;
 
 /* Function used to perform erasure coding or repair. 
  */
 
 void erasureCodeThread(ErasureCodeBench ecbench) {
+  bool ec_done = false; //Becomes true at the end when we all ec operations are completed
   bool started = false;
   int ret, index, stripe_index, _stripe_size;
   Stripe shard;
@@ -125,7 +124,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 
   }
 
-  while (!rados_done) {
+  while (!rados_done||!ec_done) {
     stripes_lock.lock();
     stripes_it = stripes.begin();
     if (stripes_it!=stripes.end()) {
@@ -140,6 +139,12 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
     }
     if (ecbench.workload == "encode") {
     ret = ecbench.encode(&encoded);
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "encoding in erasureCodeThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
     pending_buffers_lock.lock();
     for (shard_it=encoded.begin();
 	 shard_it!=encoded.end(); shard_it++) {
@@ -149,6 +154,12 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
     encoded.clear();
     pending_buffers_lock.unlock();
     } else { // for reading, we have to wait until the shards are read
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Repairing in erasureCodeThread()" << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
       for (shard_it=encoded.begin();
 	   shard_it!=encoded.end();
 	   shard_it++) {
@@ -164,6 +175,13 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 	}
       }
       ret = ecbench.decode_erasures(encoded);
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Completed stripe " << stripe_index << " erasureCodeThread()" << 
+	" Return Code " << ret << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
       /* here, the erasures have been repaired and the stripes are ready for use.
        * For now, we're putting them back into the blq.
        */
@@ -179,16 +197,17 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
       std::cerr.flush();
       output_lock.unlock();
     }
+    stripes_lock.lock();
+    if (rados_done && stripes.size() == 0)
+      ec_done = true;
+    stripes_lock.unlock();
   }
 }
 
-/* Function used by completion thread to handle completions. The main thread
- * pushes the AioCompletion* to the completion_q after the write operation
- * is performed. The thread concurrently gets a completion object from the
- * completion_q, waits for it to be safe, puts the bufferlist back into the
- * bufferlist queue, and releases the AioCompletion object. This effectively
- * allows reuse of the bufferlists conserving memory and time. It also lets
- * the waiting for completion be concurrent with the erasure coding and writing.
+/* Function used by main thread to handle reads. The read thread
+ * fills bufferlists in the pending map and sets the read flag for each shard
+ * after the read is performed. The thread concurrently gets a buffer from the
+ * pending map, issues a read, waits for read to finish (synchronously).
  * At the end of the program execution, the thread is joined which causes the
  * program execution to wait until the completion_q is empty, i.e, all of the
  * objects are safe on disk.
@@ -436,17 +455,7 @@ void radosReadThread() {
   return; // Thread terminates
 }
 
-/* Function used by completion thread to handle completions. The main thread
- * pushes the AioCompletion* to the completion_q after the write operation
- * is performed. The thread concurrently gets a completion object from the
- * completion_q, waits for it to be safe, puts the bufferlist back into the
- * bufferlist queue, and releases the AioCompletion object. This effectively
- * allows reuse of the bufferlists conserving memory and time. It also lets
- * the waiting for completion be concurrent with the erasure coding and writing.
- * At the end of the program execution, the thread is joined which causes the
- * program execution to wait until the completion_q is empty, i.e, all of the
- * objects are safe on disk.
- * @rados_done means that the main thread has finished writing shards/objects.
+ /* @rados_done means that the main thread has finished.
  * @writing_done means that the rados has finished writing shards/objects.
  */
 void radosWriteThread() {
@@ -1254,7 +1263,7 @@ int main(int argc, const char** argv) {
 	stripes_lock.unlock();
 	output_lock.lock();
 	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Writing aio test. Iteration " << j << " Queue size "
+	std::cout << "Completed test iteration " << j << " Queue size "
 		  << blq_last_size << std::endl;
 	REPORT_BENCHMARK; // Print out the benchmark for this test
 	output_lock.unlock();

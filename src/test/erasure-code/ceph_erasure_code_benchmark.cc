@@ -89,6 +89,7 @@ std::map<int,bufferlist>::iterator pbit;
 std::map<int,Stripe> stripe_data;
 std::map<int,Stripe>::iterator sit;
 std::vector<std::thread> rados_threads;
+std::thread ecThread;
 bool rados_done = false; //Becomes true at the end before we try to join the AIO competion thread.
 int blq_last_size;
 int completions_that_remain = 0;
@@ -132,70 +133,69 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
       stripe_index = stripes_it->first; // stripe_index is the stripe number
       stripes.erase(stripes_it);
       stripes_lock.unlock();
-    } else {
-      stripes_lock.unlock();
-      std::this_thread::sleep_for(thread_sleep_duration);
-      continue;
-    }
-    if (ecbench.workload == "encode") {
-    ret = ecbench.encode(&encoded);
+      if (ecbench.workload == "encode") {
+	ret = ecbench.encode(&encoded);
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "encoding in erasureCodeThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+	output_lock.lock();
+	std::cerr THREAD_ID << "encoding in erasureCodeThread()" << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 #endif
-    pending_buffers_lock.lock();
-    for (shard_it=encoded.begin();
-	 shard_it!=encoded.end(); shard_it++) {
-      pending_buffers.insert(std::pair<int,
-			     bufferlist>(stripe_index*ecbench.stripe_size+shard_it->first,shard_it->second));
-    }
-    encoded.clear();
-    pending_buffers_lock.unlock();
-    } else { // for reading, we have to wait until the shards are read
+	pending_buffers_lock.lock();
+	for (shard_it=encoded.begin();
+	     shard_it!=encoded.end(); shard_it++) {
+	  pending_buffers.insert(std::pair<int,
+				 bufferlist>(stripe_index*ecbench.stripe_size+shard_it->first,shard_it->second));
+	}
+	encoded.clear();
+	pending_buffers_lock.unlock();
+      } else { // for reading, we have to wait until the shards are read
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Repairing in erasureCodeThread()" << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+	output_lock.lock();
+	std::cerr THREAD_ID << "Repairing in erasureCodeThread()" << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 #endif
-      for (shard_it=encoded.begin();
-	   shard_it!=encoded.end();
-	   shard_it++) {
-	_stripe_size = ecbench.stripe_size;
-	index = stripe_index * _stripe_size + shard_it->first;
-	stripe_data_lock.lock();
-	shard = stripe_data.find(index)->second;
-	stripe_data_lock.unlock();
-	while (!shard.is_read()) {
+	for (shard_it=encoded.begin();
+	     shard_it!=encoded.end();
+	     shard_it++) {
+	  _stripe_size = ecbench.stripe_size;
+	  index = stripe_index * _stripe_size + shard_it->first;
+	  stripe_data_lock.lock();
+	  shard = stripe_data.find(index)->second;
+	  stripe_data_lock.unlock();
+	  while (!shard.is_read()) {
 	    std::this_thread::sleep_for(thread_sleep_duration);
 	    continue;
 	    // waits until all of the shards in the stripe have been read
+	  }
 	}
-      }
-      ret = ecbench.decode_erasures(encoded);
+	ret = ecbench.decode_erasures(encoded);
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Completed stripe " << stripe_index << " erasureCodeThread()" << 
-	" Return Code " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+	output_lock.lock();
+	std::cerr THREAD_ID << "Completed repair of stripe " << stripe_index << " erasureCodeThread()" << 
+	  std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 #endif
-      /* here, the erasures have been repaired and the stripes are ready for use.
-       * For now, we're putting them back into the blq.
-       */
-      blq_lock.lock();
-      for (shard_it=encoded.begin();shard_it!=encoded.end();shard_it++) {
-	blq.push(shard_it->second);
+	/* here, the erasures have been repaired and the stripes are ready for use.
+	 * For now, we're putting them back into the blq.
+	 */
+	blq_lock.lock();
+	for (shard_it=encoded.begin();shard_it!=encoded.end();shard_it++) {
+	  blq.push(shard_it->second);
+	}
+	encoded.clear();
       }
-      encoded.clear();
-    }
-    if (ret < 0) {
-      output_lock.lock();
-      std::cerr << "Error in erasure code call to ecbench. " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      if (ret < 0) {
+	output_lock.lock();
+	std::cerr << "Error in erasure code call to ecbench. " << ret << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+      }
+    } else {
+      stripes_lock.unlock();
+      std::this_thread::sleep_for(thread_sleep_duration);
     }
     stripes_lock.lock();
     if (rados_done && stripes.size() == 0)
@@ -596,8 +596,8 @@ void radosWriteThread() {
     pending_buffers_that_remain = pending_buffers.size();
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID  << "pending_buffers size > stripe_size " <<
-      pending_buffers_that_remain << std::endl;
+    std::cerr THREAD_ID  << "pending_buffers size (" << pending_buffers_that_remain << 
+      ") > stripe_size " << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -1115,7 +1115,7 @@ int main(int argc, const char** argv) {
     }
 
     // Start the erasureCodeThread
-    std::thread ecThread = std::thread (erasureCodeThread, ecbench);
+    ecThread = std::thread (erasureCodeThread, ecbench);
 
     // RADOS IO Test Here
     /*
@@ -1182,19 +1182,14 @@ int main(int argc, const char** argv) {
 	  blq_lock.unlock();
 #ifdef TRACE
 	  output_lock.lock();
-	  std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	  std::cerr THREAD_ID << "Created a Stripe for encoding with hash value " << data.get_hash() << 
+	    std::endl;
 	  output_lock.unlock();
 #endif
 	}
 
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Setup for write test using AIO." << std::endl;
-	REPORT_TIMING; // Print out the benchmark for this test
-
-	// The encoded map is used by the erasure coding interface.
-	START_TIMER; // Code for the begin_time of encoding
-
-	/* Push the encoded map into a queue for the threads to 
+	/* TODO: Rewrite this. The encoded map is used by the erasure coding interface.
+	 * Insert the encoded map into a map for the threads to 
 	 * read. When the shards have been read, the map is pushed
 	 * to the finished queue. For now, the threads empty the
 	 * map and put the buffers back into the blq. In a real
@@ -1204,12 +1199,6 @@ int main(int argc, const char** argv) {
 	stripes.insert(std::pair<int,std::map<int,bufferlist>>(j,encoded));
 	stripes_lock.unlock();
 
-	output_lock.lock();
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Writing aio test. Iteration " << j << " Queue size "
-		  << blq_last_size << std::endl;
-	REPORT_BENCHMARK; // Print out the benchmark for this test
-	output_lock.unlock();
       } else { // Begin Read procedure
 	for (int i=0;i<stripe_size;i++) {
 	index = j*stripe_size+i; // index == data.get_hash()
@@ -1233,18 +1222,11 @@ int main(int argc, const char** argv) {
 	}
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "Created a Stripe with hash value " << data.get_hash() << std::endl;
+	std::cerr THREAD_ID << "Created a repair Stripe with hash value " << data.get_hash() << std::endl;
 	output_lock.unlock();
 #endif
       }
 
-      // The encoded map is used by the erasure coding interface.
-
-      FINISH_TIMER; // Compute total time since START_TIMER
-      std::cout << "Setup for read test using AIO." << std::endl;
-      REPORT_TIMING; // Print out the benchmark for this test
-
-      START_TIMER; // Code for the begin_time
 	pending_buffers_lock.lock();
 	for (it=encoded.begin();
 	     it!=encoded.end(); it++) {
@@ -1262,11 +1244,6 @@ int main(int argc, const char** argv) {
 	stripes.insert(std::pair<int,std::map<int,bufferlist>>(j,encoded));
 	stripes_lock.unlock();
 	output_lock.lock();
-	FINISH_TIMER; // Compute total time since START_TIMER
-	std::cout << "Completed test iteration " << j << " Queue size "
-		  << blq_last_size << std::endl;
-	REPORT_BENCHMARK; // Print out the benchmark for this test
-	output_lock.unlock();
 
       }
     }
@@ -1281,6 +1258,8 @@ int main(int argc, const char** argv) {
     for (rit=rados_threads.begin();rit!=rados_threads.end();rit++) {
       rit->join(); // Wait for writer to finish.
     }
+
+    ecThread.join();     // Wait for the ecThread;
 
     // Locking not required after this point.
     std::cerr << "Wait for all writes to flush." << std::endl;

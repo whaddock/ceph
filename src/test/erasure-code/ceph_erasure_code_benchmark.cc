@@ -53,7 +53,7 @@
 #define DEBUG 1
 #define RADOS_THREADS 0
 #define BLQ_SLEEP_DURATION 25 // in millisecinds
-#define THREAD_SLEEP_DURATION 10 // in millisecinds
+#define THREAD_SLEEP_DURATION 5 // in millisecinds
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock(); \
@@ -109,7 +109,8 @@ std::mutex stripe_data_lock;
 void erasureCodeThread(ErasureCodeBench ecbench) {
   bool ec_done = false; //Becomes true at the end when we all ec operations are completed
   bool started = false;
-  int ret, index, stripe_index, _stripe_size;
+  int ret, index, stripe_index;
+  int _stripe_size = ecbench.stripe_size;
   Stripe shard;
   map<int,bufferlist> encoded;
   map<int,bufferlist>::iterator shard_it;
@@ -125,7 +126,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 
   }
 
-  while (!rados_done||!ec_done) {
+  while (rados_done||!ec_done) {
     stripes_lock.lock();
     stripes_it = stripes.begin();
     if (stripes_it!=stripes.end()) {
@@ -144,11 +145,12 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 	pending_buffers_lock.lock();
 	for (shard_it=encoded.begin();
 	     shard_it!=encoded.end(); shard_it++) {
+	  index = stripe_index * _stripe_size + shard_it->first;
 	  pending_buffers.insert(std::pair<int,
-				 bufferlist>(stripe_index*ecbench.stripe_size+shard_it->first,shard_it->second));
+				 bufferlist>(index,shard_it->second));
 	}
-	encoded.clear();
 	pending_buffers_lock.unlock();
+	encoded.clear();
       } else { // for reading, we have to wait until the shards are read
 #ifdef TRACE
 	output_lock.lock();
@@ -159,11 +161,17 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 	for (shard_it=encoded.begin();
 	     shard_it!=encoded.end();
 	     shard_it++) {
-	  _stripe_size = ecbench.stripe_size;
 	  index = stripe_index * _stripe_size + shard_it->first;
 	  stripe_data_lock.lock();
 	  shard = stripe_data.find(index)->second;
 	  stripe_data_lock.unlock();
+#ifdef TRACE
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "In erasureCodeThread() waiting for object " << 
+	    shard.get_object_name() << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+#endif
 	  while (!shard.is_read()) {
 	    std::this_thread::sleep_for(thread_sleep_duration);
 	    continue;
@@ -198,8 +206,14 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
       std::this_thread::sleep_for(thread_sleep_duration);
     }
     stripes_lock.lock();
-    if (rados_done && stripes.size() == 0)
-      ec_done = true;
+    if (ecbench.workload == "encode") { // We are encoding, writing waits on ec to finish.
+      if (rados_done && stripes.size() == 0)
+	ec_done = true;
+    } 
+    else { // We are repairing, must wait for read to finish.
+      if (rados_done && stripes.size() == 0)
+	ec_done = true;
+    }
     stripes_lock.unlock();
   }
 }
@@ -342,7 +356,7 @@ void radosReadThread() {
     pending_buffers_that_remain = pending_buffers.size();
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID  << "pending_buffers size > stripe_size " <<
+    std::cerr THREAD_ID  << "pbit: pending_buffers size > stripe_size " <<
       pending_buffers_that_remain << std::endl;
     std::cerr.flush();
     output_lock.unlock();
@@ -352,8 +366,8 @@ void radosReadThread() {
     if (pbit != pending_buffers.end()) {
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID  << "Writing " << pbit->first 
-			   << " to storage." << std::endl;
+      std::cerr THREAD_ID  << "pbit: Reading " << pbit->first 
+			   << " from storage." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -370,80 +384,80 @@ void radosReadThread() {
 #endif
       stripe_data_lock.unlock();
       pending_buffers_lock.unlock();
-    }
-    else {
-      pending_buffers_lock.unlock();
-      continue;
-    }
-    try {
-      ret = io_ctx.read(_data.get_object_name(),_bl,object_size,0);
-    }
-    catch (std::exception& e) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "Exception while writing object. "
-			  << _data.get_object_name() << std::endl;
-      output_lock.unlock();
-      ret = -1;
-    }
-    if (ret < 0) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "couldn't start read object! error at index "
-			  << _data.get_hash() << std::endl;
-      output_lock.unlock();
-      ret = EXIT_FAILURE;
-      failed = true; 
-      goto out;
-      // We have had a failure, so do not execute any further, 
-      // fall through.
-    } else { // Flag this shard as having been read successfully
-      _data.set_read();
-    }
+      try {
+	ret = io_ctx.read(_data.get_object_name(),_bl,object_size,0);
+      }
+      catch (std::exception& e) {
+	output_lock.lock();
+	std::cerr THREAD_ID << "Exception while writing object. "
+			    << _data.get_object_name() << std::endl;
+	output_lock.unlock();
+	ret = -1;
+      }
+      if (ret < 0) {
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't start read object! error at index "
+			    << _data.get_hash() << std::endl;
+	output_lock.unlock();
+	ret = EXIT_FAILURE;
+	failed = true; 
+	goto out;
+	// We have had a failure, so do not execute any further, 
+	// fall through.
+      } else { // Flag this shard as having been read successfully
+	_data.set_read();
+      }
 
-    try {
-      blq_lock.lock();
-      blq.push(_bl);
-      blq_lock.unlock(); // in case we exit
+      try {
+	blq_lock.lock();
+	blq.push(_bl);
+	blq_lock.unlock(); // in case we exit
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosReadThread()"
+			    << std::endl;
+	output_lock.unlock();
+#endif
+      }
+      catch (std::out_of_range& e) {
+	blq_lock.unlock(); // in case we exit
+	output_lock.lock();
+	std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
+			    << "in rados read thread " THREAD_ID
+			    << std::endl;
+	output_lock.unlock();
+	ret = -1;
+      }
+      pending_buffers_lock.lock();
+      pending_buffers_that_remain = pending_buffers.size();
+      pending_buffers_lock.unlock();
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosReadThread()"
-			  << std::endl;
-      output_lock.unlock();
-#endif
-    }
-    catch (std::out_of_range& e) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
-			  << "in rados read thread " THREAD_ID
-			  << std::endl;
-      output_lock.unlock();
-      blq_lock.unlock(); // in case we exit
-      ret = -1;
-    }
-    pending_buffers_lock.lock();
-    pending_buffers_that_remain = pending_buffers.size();
-    pending_buffers_lock.unlock();
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "pbit: " << _data.get_hash()
-			<< " pending buffer in radosReadThread() "
-			<< "pending_buffers size after push is "
-			<< pending_buffers_that_remain
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    if (DEBUG > 0) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "we wrote our object "
-			  << _data.get_object_name() 
+      std::cerr THREAD_ID << "pbit: " << _data.get_hash()
+			  << " pending buffer in radosReadThread() "
+			  << "pending_buffers size after push is "
+			  << pending_buffers_that_remain
 			  << std::endl;
       std::cerr.flush();
       output_lock.unlock();
+#endif
+      if (DEBUG > 0) {
+	output_lock.lock();
+	std::cerr THREAD_ID << "we wrote our object "
+			    << _data.get_object_name() 
+			    << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+      }
     }
-    if (pending_buffers_that_remain > num_rados_threads) {
+    else {
+      pending_buffers_lock.unlock();
       std::this_thread::sleep_for(thread_sleep_duration);
     }
+
+    pending_buffers_lock.lock();
     if (rados_done && pending_buffers_that_remain==0) reading_done = true;
+    pending_buffers_lock.unlock();
   }
   // End code from thread
 
@@ -455,11 +469,11 @@ void radosReadThread() {
   return; // Thread terminates
 }
 
- /* @rados_done means that the main thread has finished.
+/* @rados_done means that the main thread has finished.
  * @writing_done means that the rados has finished writing shards/objects.
  */
 void radosWriteThread() {
-  bool writing_done = false; //Becomes true at the end when we all completions are safe
+  bool writing_done = false; //Becomes true at the end when we all objects in pending_buffer are written
   bool started = false;
   int ret;
   // For this thread
@@ -596,8 +610,8 @@ void radosWriteThread() {
     pending_buffers_that_remain = pending_buffers.size();
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID  << "pending_buffers size (" << pending_buffers_that_remain << 
-      ") > stripe_size " << std::endl;
+    std::cerr THREAD_ID  << "pbit: pending_buffers size (" << pending_buffers_that_remain << 
+      ")" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -606,7 +620,7 @@ void radosWriteThread() {
     if (pbit != pending_buffers.end()) {
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID  << "Writing " << pbit->first 
+      std::cerr THREAD_ID  << "pbit: Writing " << pbit->first 
 			   << " to storage." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
@@ -615,7 +629,8 @@ void radosWriteThread() {
       _data = stripe_data[pbit->first];
       _bl = pbit->second;
       pending_buffers.erase(pbit);
-
+      stripe_data_lock.unlock();
+      pending_buffers_lock.unlock();
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "index: " << _data.get_hash()
@@ -623,83 +638,77 @@ void radosWriteThread() {
 			  << std::endl;
       output_lock.unlock();
 #endif
+      try {
+	ret = io_ctx.write_full(_data.get_object_name(),_bl);
+      }
+      catch (std::exception& e) {
 
-      stripe_data_lock.unlock();
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Exception while writing object. "
+			    << _data.get_object_name() << std::endl;
+	output_lock.unlock();
+#endif
+	ret = -1;
+      }
+      if (ret < 0) {
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't start write object! error at index "
+			    << _data.get_hash() << std::endl;
+	output_lock.unlock();
+#endif
+	ret = EXIT_FAILURE;
+	failed = true; 
+	goto out;
+	// We have had a failure, so do not execute any further, 
+	// fall through.
+      }
+
+      try {
+	blq_lock.lock();
+	blq.push(_bl);
+	blq_lock.unlock();
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosWriteThread()"
+			    << std::endl;
+	output_lock.unlock();
+#endif
+      }
+      catch (std::out_of_range& e) {
+	blq_lock.unlock(); // in case we catch the exception
+	ret = -1;
+	output_lock.lock();
+	std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
+			    << "in rados write thread " THREAD_ID
+			    << std::endl;
+	output_lock.unlock();
+      }
+      pending_buffers_lock.lock();
+      pending_buffers_that_remain = pending_buffers.size();
       pending_buffers_lock.unlock();
-    }
-    else {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "pbit: " << _data.get_hash()
+			  << " pending buffer in radosWriteThread() "
+			  << "pending_buffers size after push is "
+			  << pending_buffers_that_remain
+			  << std::endl;
+      std::cerr THREAD_ID << "we wrote our object "
+			  << _data.get_object_name() 
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+    } else {
       pending_buffers_lock.unlock();
-      continue;
-    }
-    try {
-      ret = io_ctx.write_full(_data.get_object_name(),_bl);
-    }
-    catch (std::exception& e) {
-
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Exception while writing object. "
-			  << _data.get_object_name() << std::endl;
-      output_lock.unlock();
-#endif
-      ret = -1;
-    }
-    if (ret < 0) {
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "couldn't start write object! error at index "
-			  << _data.get_hash() << std::endl;
-      output_lock.unlock();
-#endif
-      ret = EXIT_FAILURE;
-      failed = true; 
-      goto out;
-      // We have had a failure, so do not execute any further, 
-      // fall through.
+      std::this_thread::sleep_for(thread_sleep_duration);
     }
 
-    try {
-      blq_lock.lock();
-      blq.push(_bl);
-      blq_lock.unlock(); // in case we exit
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosWriteThread()"
-			  << std::endl;
-      output_lock.unlock();
-#endif
-    }
-    catch (std::out_of_range& e) {
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Out of range error accessing pending_buffers "
-			  << "in rados write thread " THREAD_ID
-			  << std::endl;
-      output_lock.unlock();
-#endif
-      blq_lock.unlock(); // in case we exit
-      ret = -1;
-    }
     pending_buffers_lock.lock();
-    pending_buffers_that_remain = pending_buffers.size();
-    pending_buffers_lock.unlock();
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "pbit: " << _data.get_hash()
-			<< " pending buffer in radosWriteThread() "
-			<< "pending_buffers size after push is "
-			<< pending_buffers_that_remain
-			<< std::endl;
-    std::cerr THREAD_ID << "we wrote our object "
-			<< _data.get_object_name() 
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    if (pending_buffers_that_remain > num_rados_threads) {
-      std::this_thread::sleep_for(blq_sleep_duration);
-    }
     if (rados_done && pending_buffers_that_remain==0) writing_done = true;
+    pending_buffers_lock.unlock();
   }
   // End code from thread
 
@@ -1248,10 +1257,11 @@ int main(int argc, const char** argv) {
       }
     }
 
-
-    START_TIMER; // Code for the begin_time
+    /* let the rados threads wake up and see the shards in the pending_buffers map. */
+    std::this_thread::sleep_for(blq_sleep_duration);
     rados_done = true;
 
+    START_TIMER; // Code for the begin_time
     // Code from thread
 
     std::vector<std::thread>::iterator rit;

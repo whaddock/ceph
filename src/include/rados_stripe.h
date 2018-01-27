@@ -44,6 +44,8 @@ class Stripe {
   std::string get_object_name() {
     return object_name;
   }
+  // This static class member returns a large integer when called
+  // with a bogus reference. How do we fix this?
   static int compute_hash(int _i,int _j, int _stripe_size) {
     return _j*_stripe_size+_i;
   }

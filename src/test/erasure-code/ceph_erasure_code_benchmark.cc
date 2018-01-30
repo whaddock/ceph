@@ -65,7 +65,6 @@
 
 // Globals for program
 int iterations = 0;
-int stripe_size = 0;
 int queue_size = 0;
 int object_size = 0;
 std::string obj_name;
@@ -112,7 +111,6 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
   int ret = 0;
   int index = 0;
   int stripe_index = 0;
-  const int _stripe_size = ecbench.stripe_size;
   Stripe shard;
   map<int,bufferlist> encoded;
   map<int,bufferlist>::iterator shard_it;
@@ -148,18 +146,36 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 	output_lock.unlock();
 #endif
 	pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
+	shard_it=encoded.begin();
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "Got pending_buffers_lock in erasureCodeThread()." << std::endl;
+	std::cerr THREAD_ID << "Got pending_buffers_lock in erasureCodeThread()." << 
+	  std::endl;
+	std::cerr THREAD_ID << "stripe_index " << stripe_index << std::endl;
+	std::cerr THREAD_ID << "stripe_size " << ecbench.stripe_size << std::endl;
+	std::cerr THREAD_ID << "shard_it->first " << shard_it->first << std::endl;
+	std::cerr.flush();
+	//	output_lock.unlock();
+#endif
+	for (;shard_it!=encoded.end(); shard_it++) {
+	  index = stripe_index * ecbench.stripe_size + shard_it->first;
+	  pending_buffers.insert(std::pair<int,
+				 bufferlist>(index,shard_it->second));
+	  std::cerr THREAD_ID << "Inserted buffer " << index << std::endl;
+	}
+#ifdef TRACE
+	//	output_lock.lock();
+	std::cerr THREAD_ID << "Contents of pending_buffers map after encoding:" << 
+	  std::endl;
+	for (pbit = pending_buffers.begin();
+	     pbit!=pending_buffers.end();
+	     pbit++) {
+	  std::cerr THREAD_ID << "Index: " << pbit->first << " in pending_buffer map." 
+			      << std::endl;
+	}
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	for (shard_it=encoded.begin();
-	     shard_it!=encoded.end(); shard_it++) {
-	  index = stripe_index * _stripe_size + shard_it->first;
-	  pending_buffers.insert(std::pair<int,
-				 bufferlist>(index,shard_it->second));
-	}
 	pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
 #ifdef TRACE
 	output_lock.lock();
@@ -180,7 +196,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
 	for (shard_it=encoded.begin();
 	     shard_it!=encoded.end();
 	     shard_it++) {
-	  index = stripe_index * _stripe_size + shard_it->first;
+	  index = stripe_index * ecbench.stripe_size + shard_it->first;
 	  bool found_shard = false;
 	  stripe_data_lock.lock(); // *** stripe_data_lock acquired ***
 	  std::map<int,Stripe>::iterator stripe_it = stripe_data.find(index);
@@ -892,7 +908,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
     cout << "parameter m is " << m << ". But m needs to be >= 0." << endl;
     return -EINVAL;
   } 
-
+  stripe_size = k + m;
   verbose = vm.count("verbose") > 0 ? true : false;
 
   ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
@@ -1101,18 +1117,20 @@ int ErasureCodeBench::decode()
 
 int main(int argc, const char** argv) {
   ErasureCodeBench ecbench;
+  int stripe_size = 0;
+
   try {
     int err = ecbench.setup(argc, argv);
     if (err)
       return err;
     //    return ecbench.run();
   } catch(po::error &e) {
-    cerr THREAD_ID << e.what() << endl; 
+    std::cerr THREAD_ID << e.what() << std::endl; 
     return 1;
   }
   if (rados == 0) {
     iterations = ecbench.max_iterations;
-    stripe_size = ecbench.k + ecbench.m;
+    stripe_size = ecbench.stripe_size;
     queue_size = ecbench.queue_size;
     object_size = ecbench.object_size;
     obj_name = ecbench.obj_name;
@@ -1272,6 +1290,19 @@ int main(int argc, const char** argv) {
 	  pending_buffers.insert(std::pair<int,
 				 bufferlist>(it->first,it->second));
 	}
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Contents of pending_buffers map at end of loop " <<
+	  j << "." << std::endl;
+	for (pbit = pending_buffers.begin();
+	     pbit!=pending_buffers.end();
+	     pbit++) {
+	  std::cerr THREAD_ID << "Index: " << pbit->first << " in pending_buffer map." 
+			      << std::endl;
+	}
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
 	pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
 #ifdef TRACE
 	output_lock.lock();
@@ -1295,6 +1326,19 @@ int main(int argc, const char** argv) {
     FINISH_TIMER; // Compute total time since START_TIMER
     std::cout << "All work queued." << std::endl;
     REPORT_BENCHMARK; // Print out the elapsed time for this section
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Inventory of objects in stripe_data map:" << std::endl;
+    {
+      for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
+	std::cerr THREAD_ID << "Stripe object " << sit->first 
+			    << " with hash value "
+			    << sit->second.get_hash() << std::endl;
+	std::cerr.flush();
+      }
+    }
+    output_lock.unlock();
+#endif
 
     START_TIMER; // Code for the begin_time
 
@@ -1347,6 +1391,7 @@ int main(int argc, const char** argv) {
 	  writing_done = true;
 	pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
 #ifdef TRACE
+	output_lock.lock();
 	std::cerr THREAD_ID << "Shutdown: pending_buffers.size() is " << pending_buffers_size <<
 	  " in encode routine." << std::endl;
 	std::cerr.flush();
@@ -1411,27 +1456,28 @@ int main(int argc, const char** argv) {
     utime_t end_time_final = ceph_clock_now(g_ceph_context);
     long long int total_data_processed = iterations*(ecbench.k+ecbench.m)*(ecbench.object_size/1024);
     std::cout << "Factors for computing size: iterations: " << iterations
-	 << " max_iterations: " << ecbench.max_iterations << std::endl
-	 << " stripe_size: " << ecbench.k+ecbench.m
-	 << " object_size: " << object_size 
-	 << " total data processed: " << total_data_processed << " KiB"
-	 << std::endl;
+	      << " max_iterations: " << ecbench.max_iterations << std::endl
+	      << " stripe_size: " << stripe_size 
+	      << " object_size: " << object_size 
+	      << " total data processed: " << total_data_processed << " KiB"
+	      << std::endl;
     std::cout << (end_time_final - begin_time_final) << "\t" << total_data_processed << " KiB\t"
 	      << total_data_processed/(double)(end_time_final - begin_time_final) 
 	      << " KiB/s" << std::endl;
+    std::cout.flush();
 
     // Print out the stripe object hashes and clear the stripe_data map
 #ifdef TRACE
     {
       for (sit=stripe_data.begin();sit!=stripe_data.end();sit++) {
-	std::cerr THREAD_ID << "Deleting Stripe object with hash value "
+	std::cerr THREAD_ID << "Deleting Stripe object " << sit->first 
+			    << " with hash value "
 			    << sit->second.get_hash() << std::endl;
 	std::cerr.flush();
       }
     }
 #endif
     stripe_data.clear();
-    std::cout.flush();
 
     FINISH_TIMER; // Compute total time since START_TIMER
     std::cout << "Cleanup." << std::endl;

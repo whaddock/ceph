@@ -1,24 +1,28 @@
-#ifndef RADOS_STRIPE_H
-#define RADOS_STRIPE_H
+#ifndef RADOS_SHARD_H
+#define RADOS_SHARD_H
 
-// Class to hold stripe record
-class Stripe {
+#include "include/buffer.h"
+#include <string>
+
+// Class to hold shard record
+class Shard {
  public:
   bool read;
   int stripe;
   int shard;
   int stripe_size;
   std::string object_name;
+  bufferlist bl;
 
-  Stripe(int _stripe, int _shard, int _stripe_size,
+  Shard(int _stripe, int _shard, int _stripe_size,
 	 std::string _object_name) 
     : stripe (_stripe), shard (_shard), stripe_size (_stripe_size),
     object_name (_object_name) {
       clear_read();
     };
 
-  Stripe() {};
-  ~Stripe() {};
+  Shard() {};
+  ~Shard() {};
 
   void set_read() {
     read = true;

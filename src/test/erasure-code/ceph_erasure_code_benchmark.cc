@@ -33,6 +33,7 @@
 #include "erasure-code/ErasureCodePlugin.h"
 #include "erasure-code/ErasureCode.h"
 #include "ceph_erasure_code_benchmark.h"
+#include "rados_shard.h"
 
 #include <include/rados/librados.hpp>
 #include <iostream>
@@ -47,7 +48,6 @@
 #include <mutex>
 #include <cassert>
 #include <chrono>
-#include "include/rados_stripe.h"
 
 #define TRACE
 #define DEBUG 1
@@ -80,38 +80,33 @@ const std::chrono::milliseconds blq_sleep_duration(BLQ_SLEEP_DURATION);
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::map<int,map<int,bufferlist>> stripes;
-std::map<int,map<int,bufferlist>>::iterator stripes_it;
-std::map<int,bufferlist> pending_buffers;
-std::map<int,bufferlist>::iterator pbit;
-std::map<int,Stripe> stripe_data;
-std::map<int,Stripe>::iterator sit;
+std::queue<map<int,Shard>> stripes;
+std::queue<Shard> pending_buffers;
 std::vector<std::thread> rados_threads;
 std::thread ecThread;
 bool ec_done = false; //Becomes true at the end when we all ec operations are completed
 bool reading_done = false; //Becomes true at the end when we all objects in pending_buffer are written
 bool writing_done = false; //Becomes true at the end when we all objects in pending_buffer are written
-int blq_last_size;
-int completions_that_remain = 0;
 int pending_buffers_that_remain = 0;
-int num_rados_threads = 0;
+int num_rados_threads = RADOS_THREADS;
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
 std::mutex blq_lock;
 std::mutex stripes_lock;
 std::mutex pending_buffers_lock;
-std::mutex stripe_data_lock;
 
-/* Function used to perform erasure coding or repair. 
+/* Function used to perform erasure encoding.
  */
 
-void erasureCodeThread(ErasureCodeBench ecbench) {
+void erasureEncodeThread(ErasureCodeBench ecbench) {
   bool started = false;
   int ret = 0;
   int index = 0;
   int stripe_index = 0;
-  Stripe shard;
+  Shard shard;
+  map<int,Shard> stripe;
+  map<int,Shard>::interator stripe_it;
   map<int,bufferlist> encoded;
   map<int,bufferlist>::iterator shard_it;
 
@@ -119,7 +114,7 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
     started = true;
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID << "Starting erasureCodeThread()" << std::endl;
+    std::cerr THREAD_ID << "Starting erasureEncodeThread()" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -127,377 +122,77 @@ void erasureCodeThread(ErasureCodeBench ecbench) {
   while (!ec_done) {
     bool do_stripe = false;
     stripes_lock.lock(); // *** stripes_lock acquired ***
-    stripes_it = stripes.begin();
-    if (stripes_it!=stripes.end()) {
+    if (!stripes.empty()) {
       do_stripe = true;
-      encoded = stripes_it->second;
-      stripe_index = stripes_it->first; // stripe_index is the stripe number
-      stripes.erase(stripes_it);
+      stripe = stripes.front();
+      stripes.pop();
     }
     stripes_lock.unlock(); // !!! stripes_lock released !!!
     if (do_stripe) {
-      if (ecbench.workload == "encode") {
-	ret = ecbench.encode(&encoded);
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Stripe " << stripe_index << " encoded in erasureCodeThread()" << 
-	  std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
-	shard_it=encoded.begin();
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Got pending_buffers_lock in erasureCodeThread()." << 
-	  std::endl;
-	std::cerr THREAD_ID << "stripe_index " << stripe_index << std::endl;
-	std::cerr THREAD_ID << "stripe_size " << ecbench.stripe_size << std::endl;
-	std::cerr THREAD_ID << "shard_it->first " << shard_it->first << std::endl;
-	std::cerr.flush();
-	//	output_lock.unlock();
-#endif
-	for (;shard_it!=encoded.end(); shard_it++) {
-	  index = stripe_index * ecbench.stripe_size + shard_it->first;
-	  pending_buffers.insert(std::pair<int,
-				 bufferlist>(index,shard_it->second));
-	  std::cerr THREAD_ID << "Inserted buffer " << index << std::endl;
-	}
-#ifdef TRACE
-	//	output_lock.lock();
-	std::cerr THREAD_ID << "Contents of pending_buffers map after encoding:" << 
-	  std::endl;
-	for (pbit = pending_buffers.begin();
-	     pbit!=pending_buffers.end();
-	     pbit++) {
-	  std::cerr THREAD_ID << "Index: " << pbit->first << " in pending_buffer map." 
-			      << std::endl;
-	}
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Released pending_buffers_lock in ecThread." << std::endl;
-	std::cerr.flush();
-	std::cerr THREAD_ID << "Encoding done, buffers inserted, in erasureCodeThread()." << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	encoded.clear();
-      } else { // for reading, we have to wait until the shards are read
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Repairing in erasureCodeThread()" << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	for (shard_it=encoded.begin();
-	     shard_it!=encoded.end();
-	     shard_it++) {
-	  index = stripe_index * ecbench.stripe_size + shard_it->first;
-	  bool found_shard = false;
-	  stripe_data_lock.lock(); // *** stripe_data_lock acquired ***
-	  std::map<int,Stripe>::iterator stripe_it = stripe_data.find(index);
-	  if (stripe_it != stripe_data.end()) {
-	    found_shard = true;
-	    shard = stripe_it->second;
-	  }
-	  stripe_data_lock.unlock(); // !!! stripe_data_lock released !!!
-	  if (found_shard) {
-#ifdef TRACE
-	    output_lock.lock();
-	    std::cerr THREAD_ID << "In erasureCodeThread() waiting for object " << 
-	      shard.get_object_name() << std::endl;
-	    std::cerr.flush();
-	    output_lock.unlock();
-#endif
-	    while (!shard.is_read()) {
-	      std::this_thread::sleep_for(thread_sleep_duration);
-	      continue;
-	      // waits until all of the shards in the stripe have been read
-	    }
-	  }
-	}
-	ret = ecbench.decode_erasures(encoded);
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Completed repair of stripe " << stripe_index << " erasureCodeThread()" << 
-	  std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	/* here, the erasures have been repaired and the stripes are ready for use.
-	 * For now, we're putting them back into the blq.
-	 */
-	blq_lock.lock(); // *** blq_lock acquired ***
-	for (shard_it=encoded.begin();shard_it!=encoded.end();shard_it++) {
-	  blq.push(shard_it->second);
-	}
-	blq_lock.unlock(); // !!! blq_lock released !!!
-	encoded.clear();
+      for (shard_it=stripe.begin();
+	   shard_it!=stripe.end();shard_id++) {
+	encoded.insert(shard_it->first,shard_it->second.bl);
       }
-      if (ret < 0) {
-	output_lock.lock();
-	std::cerr << "Error in erasure code call to ecbench. " << ret << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-      }
-    } else {
-      std::this_thread::sleep_for(thread_sleep_duration);
-    }
-  }
-}
-
-/* Function used by main thread to handle reads. The read thread
- * fills bufferlists in the pending map and sets the read flag for each shard
- * after the read is performed. The thread concurrently gets a buffer from the
- * pending map, issues a read, waits for read to finish (synchronously).
- * At the end of the program execution, the thread is joined which causes the
- * program execution to wait until the completion_q is empty, i.e, all of the
- * objects are safe on disk.
- * @reading_done means that the rados has finished writing shards/objects.
- */
-void radosReadThread() {
-  bool started = false;
-  int ret;
-  // For this thread
-  librados::IoCtx io_ctx;
-
-  // first, we create a Rados object and initialize it
-  librados::Rados rados;
-
-  if(!started) {
-    started = true;
+      ret = ecbench.encode(&encoded);
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting radosReadThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    ret = rados.init("admin"); // just use the client.admin keyring
-    if (ret < 0) { // let's handle any error that might have come back
+      stripe_index = stripe.begin()->second.get_stripe();
       output_lock.lock();
-      std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
-      output_lock.unlock();
-      ret = EXIT_FAILURE;
-      goto out;
-    } else {
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
-      output_lock.unlock();
-#endif
-    }
-
-    /*
-     * Now we need to get the rados object its config info. It can
-     * parse argv for us to find the id, monitors, etc, so let's just
-     * use that.
-     */
-    {
-      ret = rados.conf_parse_argv(_argc, _argv);
-      if (ret < 0) {
-	// This really can't happen, but we need to check to be a good citizen.
-	output_lock.lock();
-	std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
-	output_lock.unlock();
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
-	output_lock.unlock();
-#endif
-	// We also want to apply the config file if the user specified
-	// one, and conf_parse_argv won't do that for us.
-	for (int i = 0; i < _argc; ++i) {
-	  if ((strcmp(_argv[i], "-c") == 0) || (strcmp(_argv[i], "--conf") == 0)) {
-	    ret = rados.conf_read_file(_argv[i+1]);
-	    if (ret < 0) {
-	      // This could fail if the config file is malformed, but it'd be hard.
-	      output_lock.lock();
-	      std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
-				  << "! error" << ret << std::endl;
-	      output_lock.unlock();
-	      ret = EXIT_FAILURE;
-	      goto out;
-	    }
-	    break;
-	  }
-	}
-      }
-    }
-
-    /*
-     * next, we actually connect to the cluster
-     */
-    {
-      ret = rados.connect();
-      if (ret < 0) {
-	output_lock.lock();
-	std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
-	output_lock.unlock();
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
-	output_lock.unlock();
-#endif
-      }
-    }
-
-    /*
-     * create an "IoCtx" which is used to do IO to a pool
-     */
-    {
-      ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
-      if (ret < 0) {
-	output_lock.lock();
-	std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
-	output_lock.unlock();
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "we just created an ioctx for our pool" << std::endl;
-	output_lock.unlock();
-#endif
-      }
-    }
-  }
-  // Read loop 
-  while (!reading_done) {
-    Stripe _data;
-    bufferlist _bl;
-    bool found_buffer = false;
-    bool found_stripe = false;
-    // wait for the request to complete, and check that it succeeded.
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID  << "In radosReadThread() outer while loop." << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Got pending_buffers_lock in radosReadThread()." << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    pending_buffers_that_remain = pending_buffers.size();
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID  << "pbit: pending_buffers size > stripe_size " <<
-      pending_buffers_that_remain << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-
-    pbit = pending_buffers.begin();
-    if (pbit != pending_buffers.end()) {
-      found_buffer = true;
-      int index = pbit->first;
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID  << "pbit: Reading " << index
-			   << " from storage." << std::endl;
+      std::cerr THREAD_ID << "Stripe " << stripe_index << " encoded in erasureCodeThread()" << 
+	std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
-      stripe_data_lock.lock(); // *** stripe_data_lock acquired ***
-      found_stripe = false;
-      std::map<int,Stripe>::iterator stripe_it = stripe_data.find(index);
-      if (stripe_it != stripe_data.end()) {
-	found_stripe = true;
-	_data = stripe_it->second;
-      }
-      stripe_data_lock.unlock(); // !!! stripe_data_lock released !!!
-      _bl = pbit->second;
-      pending_buffers.erase(pbit);
+      pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
+      shard_it=stripe.begin();
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "index: " << index
-			  << " pending buffer erased in radosReadThread()"
-			  << std::endl;
+      std::cerr THREAD_ID << "Got pending_buffers_lock in erasureCodeThread()." << 
+	std::endl;
+      std::cerr THREAD_ID << "stripe_index " << stripe_index << std::endl;
+      std::cerr THREAD_ID << "stripe_size " << ecbench.stripe_size << std::endl;
+      std::cerr THREAD_ID << "shard_it->first " << shard_it->first << std::endl;
+      std::cerr.flush();
+      //	output_lock.unlock();
+#endif
+      for (;shard_it!=stripe.end(); shard_it++) {
+	pending_buffers.push(shard_it-second);
+	std::cerr THREAD_ID << "Pushed buffer " << shard_it-second.get_hash() <<
+	  " to pending_buffer_queue."  << std::endl;
+      }
+#ifdef TRACE
+      //	output_lock.lock();
+      std::cerr THREAD_ID << "Contents of pending_buffers map after encoding:" << 
+	std::endl;
+      for (pbit = pending_buffers.begin();
+	   pbit!=pending_buffers.end();
+	   pbit++) {
+	std::cerr THREAD_ID << "Index: " << pbit->get_hash() << " in pending_buffer map." 
+			    << std::endl;
+      }
+      std::cerr.flush();
       output_lock.unlock();
 #endif
+      pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Released pending_buffers_lock in ecThread." << std::endl;
+      std::cerr.flush();
+      std::cerr THREAD_ID << "Encoding done, buffers inserted, in erasureCodeThread()." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+      encoded.clear();
     }
-    pending_buffers_lock.unlock(); // *** pending_buffers_lock released ***
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Released pending_buffers_lock in radosReadThread." << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-
-    if (found_buffer) {
-      if (found_stripe) {
-	try {
-	  ret = io_ctx.read(_data.get_object_name(),_bl,object_size,0);
-	}
-	catch (std::exception& e) {
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Exception while writing object. "
-			      << _data.get_object_name() << std::endl;
-	  output_lock.unlock();
-	  ret = -1;
-	}
-	if (ret < 0) {
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "couldn't start read object! error at index "
-			      << _data.get_hash() << std::endl;
-	  output_lock.unlock();
-	  ret = EXIT_FAILURE;
-	  failed = true; 
-	  goto out;
-	  // We have had a failure, so do not execute any further, 
-	  // fall through.
-	} else { // Flag this shard as having been read successfully
-	  _data.set_read();
-	}
-
-	blq_lock.lock(); // *** blq_lock acquired ***
-	blq.push(_bl);
-	blq_lock.unlock(); // !!! blq_lock released !!!
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosReadThread()"
-			    << std::endl;
-	output_lock.unlock();
-#endif
-	if (DEBUG > 0) {
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "we wrote our object "
-			      << _data.get_object_name() 
-			      << std::endl;
-	  std::cerr.flush();
-	  output_lock.unlock();
-	}
-      } // Endo of found_stripe block
-    } // End of found_buffer block
-    else {
-      std::this_thread::sleep_for(thread_sleep_duration);
-    }
-  } // End Read loop
-
- out:
-  rados.shutdown();
-  ret = failed ? ret:EXIT_SUCCESS;
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Read thread exiting now." << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-
-  return; // Thread terminates
+    if (ret < 0) {
+      output_lock.lock();
+      std::cerr << "Error in erasure code call to ecbench. " << ret << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+    } 
+  } else {
+    std::this_thread::sleep_for(thread_sleep_duration);
+  }
+}
 }
 
 /* @writing_done means that the rados has finished writing shards/objects.
@@ -629,7 +324,7 @@ void radosWriteThread() {
     // wait for the request to complete, and check that it succeeded.
     bool found_stripe = false;
     bool do_write = false;
-    Stripe _data;
+    Shard shard;
     bufferlist _bl;
 #ifdef TRACE
     output_lock.lock();
@@ -655,9 +350,8 @@ void radosWriteThread() {
     output_lock.unlock();
 #endif
 
-    pbit = pending_buffers.begin();
-    if (pbit != pending_buffers.end()) {
-      /* This code only executes if there are any tuples in pending_buffers */
+    if (!pending_buffers.empty() {
+      /* This code only executes if there are any Shards in pending_buffers */
       do_write = true; // We have a buffer to write.
 #ifdef TRACE
       output_lock.lock();
@@ -666,16 +360,8 @@ void radosWriteThread() {
       std::cerr.flush();
       output_lock.unlock();
 #endif
-      found_stripe = false;
-      stripe_data_lock.lock(); // *** stripe_data_lock acquired ***
-      std::map<int,Stripe>::iterator stripe_it = stripe_data.find(pbit->first);
-      if (stripe_it != stripe_data.end()) {
-	found_stripe = true;
-	_data = stripe_it->second;
-      }
-      stripe_data_lock.unlock(); // !!! stripe_data_lock released !!!
-      _bl = pbit->second;
-      pending_buffers.erase(pbit);
+      shard = pending_buffers.front();
+      pending_buffers.pop();
     } // End of loop over pending_buffer list elements.
 
     pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
@@ -686,36 +372,22 @@ void radosWriteThread() {
       output_lock.unlock();
 #endif
 
-    if (found_stripe) {
-      /* This code only executes if the Stripe object exists for this index. */
       if (do_write) {
 	/* This code only executes if the buffer was found in the pending_buffer list. */
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "index: " << _data.get_hash()
+	std::cerr THREAD_ID << "index: " << shard.get_hash()
 			    << " pending buffer erased in radosWriteThread()"
 			    << std::endl;
 	output_lock.unlock();
 #endif
 
-	try {
-	  ret = io_ctx.write_full(_data.get_object_name(),_bl);
-	}
-	catch (std::exception& e) {
-#ifdef TRACE
-	  output_lock.lock();
-	  std::cerr THREAD_ID << "Exception while writing object. "
-			      << _data.get_object_name() << std::endl;
-	  output_lock.unlock();
-#endif
-	  ret = -1;
-	}
-
+	  ret = io_ctx.write_full(shard.get_object_name(),shard.bl);
 	if (ret < 0) {
 #ifdef TRACE
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "couldn't start write object! error at index "
-			      << _data.get_hash() << std::endl;
+			      << shard.get_hash() << std::endl;
 	  output_lock.unlock();
 #endif
 	  ret = EXIT_FAILURE;
@@ -727,14 +399,14 @@ void radosWriteThread() {
 
 	  /* We have written the buffer to the object store. Push the buffer back onto the blq. */
 	blq_lock.lock(); // *** blq_lock acquired ***
-	blq.push(_bl);
+	blq.push(shard.bl);
 	blq_lock.unlock(); // !!! blq_lock released !!!
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "index: " << _data.get_hash() << " buffer to blq in radosWriteThread()"
+	std::cerr THREAD_ID << "index: " << shard.get_hash() << " buffer to blq in radosWriteThread()"
 			    << std::endl;
 	std::cerr THREAD_ID << "we wrote our object "
-			    << _data.get_object_name() 
+			    << shard.get_object_name() 
 			    << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();

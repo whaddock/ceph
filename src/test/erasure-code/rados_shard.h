@@ -28,6 +28,10 @@ class Shard {
     read = true;
   }
 
+  void set_bufferlist(bufferlist _bl) {
+    bl = _bl;
+  }
+
   void clear_read() {
     read = true;
   }
@@ -43,7 +47,7 @@ class Shard {
     return this->shard;
   }
   int get_hash() {
-    return Stripe::compute_hash(this->shard,this->stripe,this->stripe_size);
+    return Shard::compute_hash(this->shard,this->stripe,this->stripe_size);
   }
   std::string get_object_name() {
     return object_name;

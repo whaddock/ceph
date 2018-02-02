@@ -103,3 +103,7 @@ Makefile
 
 # not sure what generates this...
 /ceph.tmpe
+
+# Gibraltar stuff
+*.log
+*.out

@@ -1,18 +1,20 @@
 #ifndef RADOS_SHARD_H
 #define RADOS_SHARD_H
 
-#include "include/buffer.h"
+#include <include/rados/librados.hpp>
 #include <string>
 
 // Class to hold shard record
 class Shard {
+ private:
+  librados::bufferlist bl;
+
  public:
   bool read;
   int stripe;
   int shard;
   int stripe_size;
   std::string object_name;
-  bufferlist bl;
 
   Shard(int _stripe, int _shard, int _stripe_size,
 	 std::string _object_name) 
@@ -28,7 +30,11 @@ class Shard {
     read = true;
   }
 
-  void set_bufferlist(bufferlist _bl) {
+  librados::bufferlist get_bufferlist() {
+    return bl;
+  }
+
+  void set_bufferlist(librados::bufferlist _bl) {
     bl = _bl;
   }
 

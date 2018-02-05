@@ -15,6 +15,7 @@
  *
  */
 
+
 #include <boost/scoped_ptr.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/program_options/option.hpp>
@@ -52,8 +53,8 @@
 #define TRACE
 #define DEBUG 1
 #define RADOS_THREADS 0
-#define BLQ_SLEEP_DURATION 25 // in millisecinds
-#define THREAD_SLEEP_DURATION 5 // in millisecinds
+#define BLQ_SLEEP_DURATION 100 // in millisecinds
+#define THREAD_SLEEP_DURATION 25 // in millisecinds
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
 #define START_TIMER begin_time = std::clock();
 #define FINISH_TIMER end_time = std::clock();				\
@@ -305,7 +306,6 @@ void radosWriteThread() {
     // wait for the request to complete, and check that it succeeded.
     bool do_write = false;
     Shard shard;
-    librados::bufferlist _bl;
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID  << "In radosWriteThread() outer while loop." << std::endl;
@@ -361,12 +361,40 @@ void radosWriteThread() {
 			  << std::endl;
       output_lock.unlock();
 #endif
-      librados::bufferlist bl = shard.get_bufferlist();
-      ret = io_ctx.write_full(shard.get_object_name(),bl);
+      librados::bufferlist _bl = shard.get_bufferlist();
+      librados::AioCompletion* c = 
+	librados::Rados::aio_create_completion(NULL,NULL,NULL);
+      ret = io_ctx.aio_write_full(shard.get_object_name(),c,_bl);
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "AIO Write called."
+			  << std::endl;
+      output_lock.unlock();
+#endif
       if (ret < 0) {
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't start write object! error at index "
+			    << shard.get_hash() << std::endl;
+	output_lock.unlock();
+#endif
+	ret = EXIT_FAILURE;
+	failed = true; 
+	goto out;
+	// We have had a failure, so do not execute any further, 
+	// fall through.
+      }
+      ret = c->wait_for_safe();
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "AIO Write completed"
+			  << std::endl;
+      output_lock.unlock();
+#endif
+      if (ret < 0) {
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "ERROR waiting for safe on AIO Completion"
 			    << shard.get_hash() << std::endl;
 	output_lock.unlock();
 #endif

@@ -362,12 +362,10 @@ void radosWriteThread() {
       output_lock.unlock();
 #endif
       librados::bufferlist _bl = shard.get_bufferlist();
-      librados::AioCompletion* c = 
-	librados::Rados::aio_create_completion(NULL,NULL,NULL);
-      ret = io_ctx.aio_write_full(shard.get_object_name(),c,_bl);
+      ret = io_ctx.write_full(shard.get_object_name(),_bl);
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "AIO Write called."
+      std::cerr THREAD_ID << "Write called."
 			  << std::endl;
       output_lock.unlock();
 #endif
@@ -375,26 +373,6 @@ void radosWriteThread() {
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't start write object! error at index "
-			    << shard.get_hash() << std::endl;
-	output_lock.unlock();
-#endif
-	ret = EXIT_FAILURE;
-	failed = true; 
-	goto out;
-	// We have had a failure, so do not execute any further, 
-	// fall through.
-      }
-      ret = c->wait_for_safe();
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "AIO Write completed"
-			  << std::endl;
-      output_lock.unlock();
-#endif
-      if (ret < 0) {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "ERROR waiting for safe on AIO Completion"
 			    << shard.get_hash() << std::endl;
 	output_lock.unlock();
 #endif

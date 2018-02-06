@@ -50,18 +50,17 @@
 #include <cassert>
 #include <chrono>
 
-#define TRACE
-#define DEBUG 1
 #define RADOS_THREADS 0
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
 #define THREAD_SLEEP_DURATION 25 // in millisecinds
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
-#define START_TIMER begin_time = std::clock();
-#define FINISH_TIMER end_time = std::clock();				\
-  total_time_ms = (end_time - begin_time) / (double)(CLOCKS_PER_SEC / 1000);
-#define REPORT_TIMING std::cout << total_time_ms  << " ms\t" << std::endl;
+#define START_TIMER begin_time = ceph_clock_now(g_ceph_context);
+#define FINISH_TIMER end_time = ceph_clock_now(g_ceph_context);	\
+  total_time_ms = (end_time - begin_time);
+#define REPORT_TIMING std::cout << total_time_ms  << " ms\t" << end_time << std::endl;
 #define REPORT_BENCHMARK std::cout << total_time_ms  << " ms\t" << ((double)stripe_size * (double)object_size) / (1024*1024) << " MB\t" \
-  << ((double)stripe_size * (double)object_size) / (double)(1024*total_time_ms) << " MB/s" << std::endl; \
+  << ((double)stripe_size * (double)object_size) / (double)(1024*total_time_ms) \
+  << " MB/s\t" << std::endl; \
   total_run_time_ms += total_time_ms;
 
 // Globals for program
@@ -637,7 +636,8 @@ int ErasureCodeBench::encode(map<int, bufferlist> *encoded)
   if (code)
     return code;
   utime_t end_time = ceph_clock_now(g_ceph_context);
-  cout << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
+  cout << (end_time - begin_time) << "\t" << ((in_size / 1024)) 
+       << "\t" << begin_time << "\t" << end_time << endl;
   return 0;
 }
 
@@ -782,6 +782,12 @@ int main(int argc, const char** argv) {
   int stripe_size = 0;
   int blq_last_size = 0;
 
+  // variables used for timing
+  utime_t end_time;
+  utime_t begin_time;
+  utime_t total_time_ms;
+  utime_t total_run_time_ms;
+
   try {
     int err = ecbench.setup(argc, argv);
     if (err)
@@ -791,6 +797,7 @@ int main(int argc, const char** argv) {
     std::cerr THREAD_ID << e.what() << std::endl; 
     return 1;
   }
+  START_TIMER; // Code for the begin_time
   if (rados == 0) {
     iterations = ecbench.max_iterations;
     stripe_size = ecbench.stripe_size;
@@ -799,13 +806,6 @@ int main(int argc, const char** argv) {
     obj_name = ecbench.obj_name;
     pool_name = ecbench.pool_name;
 
-    // variables used for timing
-    std::clock_t end_time;
-    std::clock_t begin_time;
-    std::clock_t total_time_ms = 0;
-    std::clock_t total_run_time_ms = 0;
-
-    START_TIMER; // Code for the begin_time
     std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
     std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
     std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
@@ -839,6 +839,11 @@ int main(int argc, const char** argv) {
      * We iterate over the procedure writing stripes of data.
      */
 
+    FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Program startup done." << std::endl;
+    REPORT_TIMING;
+
+    START_TIMER; // Code for the begin_time of buffer creation
     blq_lock.lock(); // *** blq_lock acquired ***
     for (int i=0;i<queue_size;i++) {
       librados::bufferlist bl;
@@ -857,6 +862,9 @@ int main(int argc, const char** argv) {
     output_lock.unlock();
 #endif
     // Get a stripe of bufferlists from the queue
+    FINISH_TIMER; // Compute total time since START_TIMER
+    std::cout << "Buffers created." << std::endl;
+    REPORT_TIMING;
 
     START_TIMER; // Code for the begin_time
     // the iteration loop begins here
@@ -915,7 +923,7 @@ int main(int argc, const char** argv) {
 
     FINISH_TIMER; // Compute total time since START_TIMER
     std::cout << "All work queued." << std::endl;
-    REPORT_BENCHMARK; // Print out the elapsed time for this section
+    REPORT_TIMING;
 
     START_TIMER; // Code for the begin_time
 
@@ -930,8 +938,8 @@ int main(int argc, const char** argv) {
      * flag. 
      * Shutdown logic begins here.
      */
-    const std::chrono::milliseconds debug_sleep_duration(1000);
-    std::this_thread::sleep_for(debug_sleep_duration);
+    //    const std::chrono::milliseconds debug_sleep_duration(1000);
+    //    std::this_thread::sleep_for(debug_sleep_duration);
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Shutdown: Starting test for done." << std::endl;
@@ -963,7 +971,9 @@ int main(int argc, const char** argv) {
        */
       while (!writing_done) {
 	pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
+#ifdef TRACE
 	int pending_buffers_size = pending_buffers.size();
+#endif
 	if (pending_buffers.empty())
 	  writing_done = true;
 	pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
@@ -996,12 +1006,14 @@ int main(int argc, const char** argv) {
     std::cerr.flush();
     utime_t end_time_final = ceph_clock_now(g_ceph_context);
     long long int total_data_processed = iterations*(ecbench.k+ecbench.m)*(ecbench.object_size/1024);
+#ifdef TRACE
     std::cout << "Factors for computing size: iterations: " << iterations
 	      << " max_iterations: " << ecbench.max_iterations << std::endl
 	      << " stripe_size: " << stripe_size 
 	      << " object_size: " << object_size 
 	      << " total data processed: " << total_data_processed << " KiB"
 	      << std::endl;
+#endif
     std::cout << (end_time_final - begin_time_final) << "\t" << total_data_processed << " KiB\t"
 	      << total_data_processed/(double)(end_time_final - begin_time_final) 
 	      << " KiB/s" << std::endl;
@@ -1023,6 +1035,7 @@ int main(int argc, const char** argv) {
 
     FINISH_TIMER; // Compute total time since START_TIMER
     std::cout << "Cleanup." << std::endl;
+    REPORT_TIMING;
     REPORT_BENCHMARK; // Print out the elapsed time for this section
     std::cout << "Total run time " << total_run_time_ms << " ms" << std::endl;
   } else {

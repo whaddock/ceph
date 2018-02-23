@@ -50,6 +50,7 @@
 #include <cassert>
 #include <chrono>
 
+#define TRACE
 #define RADOS_THREADS 0
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
 #define THREAD_SLEEP_DURATION 25 // in millisecinds
@@ -85,11 +86,13 @@ std::queue<Shard> pending_buffers;
 std::map<int,Shard> shards;
 std::vector<std::thread> rados_threads;
 std::thread ecThread;
+std::thread blThread;
 bool ec_done = false; //Becomes true at the end when we all ec operations are completed
 bool reading_done = false; //Becomes true at the end when we all objects in pending_buffer are written
 bool writing_done = false; //Becomes true at the end when we all objects in pending_buffer are written
 int pending_buffers_that_remain = 0;
-int num_rados_threads = RADOS_THREADS;
+int concurrentios = RADOS_THREADS;
+int blq_last_size = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
@@ -97,6 +100,39 @@ std::mutex blq_lock;
 std::mutex stripes_lock;
 std::mutex shards_lock;
 std::mutex pending_buffers_lock;
+
+/* Function used for buffer list creation thread 
+ */
+void bufferListCreatorThread() {
+  bool started = false;
+
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting bufferListCreatorThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+  }
+  for (int i=0;i<queue_size;i++) {
+    librados::bufferlist bl;
+    bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
+    blq_lock.lock(); // *** blq_lock acquired ***
+    blq.push(bl);
+    blq_last_size = blq.size();
+    blq_lock.unlock(); // !!! blq_lock released !!!
+  }
+
+#ifdef TRACE
+  output_lock.lock();
+  std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
+		      << "\tCurrently there are " << blq_last_size << " buffers in the queue."
+		      << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+#endif
+}
 
 /* Function used to perform erasure encoding.
  */
@@ -147,16 +183,20 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
       std::cerr THREAD_ID << "Got pending_buffers_lock in erasureCodeThread()." << 
 	std::endl;
       std::cerr.flush();
-      //      output_lock.unlock();
+      output_lock.unlock();
 #endif
       for (stripe_it=stripe.begin();stripe_it!=stripe.end();stripe_it++) {
 	pending_buffers.push(stripe_it->second);
+#ifdef TRACE
+      output_lock.lock();
 	std::cerr THREAD_ID << "Pushed buffer " << stripe_it->second.get_hash() <<
 	  " to pending_buffer_queue."  << std::endl;
+      output_lock.unlock();
+#endif
       }
       pending_buffers_lock.unlock(); // !!! pending_buffers_lock released !!!
 #ifdef TRACE
-      //      output_lock.lock();
+      output_lock.lock();
       std::cerr THREAD_ID << "Released pending_buffers_lock in ecThread." << std::endl;
       std::cerr.flush();
       std::cerr THREAD_ID << "Encoding done, buffers inserted, in erasureCodeThread()." << std::endl;
@@ -180,6 +220,7 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
  */
 void radosWriteThread() {
   bool started = false;
+  list<librados::AioCompletion *> completions;
   int ret;
   // For this thread
   librados::IoCtx io_ctx;
@@ -300,6 +341,7 @@ void radosWriteThread() {
       }
     }
   }
+
   // Write loop 
   while (!writing_done) {
     // wait for the request to complete, and check that it succeeded.
@@ -360,8 +402,24 @@ void radosWriteThread() {
 			  << std::endl;
       output_lock.unlock();
 #endif
+      // throttle...
+      while (completions.size() > concurrentios) {
+	librados::AioCompletion *c = completions.front();
+	c->wait_for_complete();
+	ret = c->get_return_value();
+	c->release();
+	completions.pop_front();
+	if (ret < 0) {
+	  cerr << "aio_write failed" << std::endl;
+	  return;
+	}
+      }
+
+      librados::AioCompletion *c = rados.aio_create_completion(NULL, NULL, NULL);
+      completions.push_back(c);
+
       librados::bufferlist _bl = shard.get_bufferlist();
-      ret = io_ctx.write_full(shard.get_object_name(),_bl);
+      ret = io_ctx.aio_write_full(shard.get_object_name(),c,_bl);
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "Write called."
@@ -409,6 +467,18 @@ void radosWriteThread() {
   }   // End Write loop
 
  out:
+  list<librados::AioCompletion *>::iterator iter;
+  for (iter = completions.begin(); iter != completions.end(); ++iter) {
+    librados::AioCompletion *c = *iter;
+    c->wait_for_complete();
+    ret = c->get_return_value();
+    c->release();
+    if (ret < 0) { // yes, we leak.
+      cerr << "aio_write failed" << std::endl;
+      return;
+    }
+  }
+
   rados.shutdown();
   ret = failed ? ret:EXIT_SUCCESS;
 #ifdef TRACE
@@ -420,6 +490,7 @@ void radosWriteThread() {
 
   return; // Thread terminates
 }
+
 
 namespace po = boost::program_options;
 
@@ -542,7 +613,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
 
   in_size = vm["size"].as<int>();
   rados = vm["rados"].as<int>();
-  num_rados_threads = vm["threads"].as<int>();
+  concurrentios = vm["threads"].as<int>();
   queue_size = vm["queuesize"].as<int>();
   object_size = vm["object_size"].as<int>(); 
   max_iterations = vm["iterations"].as<int>();
@@ -780,7 +851,6 @@ int ErasureCodeBench::decode()
 int main(int argc, const char** argv) {
   ErasureCodeBench ecbench;
   int stripe_size = 0;
-  int blq_last_size = 0;
 
   // variables used for timing
   utime_t end_time;
@@ -819,14 +889,13 @@ int main(int argc, const char** argv) {
 
     // Start the radosWriteThread
     if (ecbench.workload == "encode") {
-      for (int i=0;i<num_rados_threads;i++) {
-	rados_threads.push_back(std::thread (radosWriteThread));
-      }
+      rados_threads.push_back(std::thread (radosWriteThread));
     } else {
-      for (int i=0;i<num_rados_threads;i++) {
 	//	rados_threads.push_back(std::thread (radosReadThread));
-      }
     }
+
+    // Start the bufferListCreatorThread
+    blThread = std::thread (bufferListCreatorThread);
 
     // Start the erasureEncodeThread
     ecThread = std::thread (erasureEncodeThread, ecbench);
@@ -841,29 +910,6 @@ int main(int argc, const char** argv) {
 
     FINISH_TIMER; // Compute total time since START_TIMER
     std::cout << "Program startup done." << std::endl;
-    REPORT_TIMING;
-
-    START_TIMER; // Code for the begin_time of buffer creation
-    blq_lock.lock(); // *** blq_lock acquired ***
-    for (int i=0;i<queue_size;i++) {
-      librados::bufferlist bl;
-      bl.append(std::string(object_size,(char)i%26+97)); // start with 'a'
-      blq.push(bl);
-    }
-    blq_last_size = blq.size();
-    blq_lock.unlock(); // !!! blq_lock released !!!
-
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Just made bufferlist queue with specified buffers." << std::endl
-			<< "\tCurrently there are " << blq_last_size << " buffers in the queue."
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    // Get a stripe of bufferlists from the queue
-    FINISH_TIMER; // Compute total time since START_TIMER
-    std::cout << "Buffers created." << std::endl;
     REPORT_TIMING;
 
     START_TIMER; // Code for the begin_time
@@ -946,6 +992,7 @@ int main(int argc, const char** argv) {
     std::cerr.flush();
     output_lock.unlock();
 #endif
+    blThread.join(); // This should have finished at the beginning.
 
     if (ecbench.workload == "encode") { // encoding/writing case
       while (!ec_done) {

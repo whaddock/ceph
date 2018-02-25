@@ -440,10 +440,11 @@ void radosWriteThread() {
 	// fall through.
       }
 
-      /* We have written the buffer to the object store. Push the buffer back onto the blq. */
+      /* We have written the buffer to the object store. Push the buffer back onto the blq. 
       blq_lock.lock(); // *** blq_lock acquired ***
       blq.push(shard.get_bufferlist());
       blq_lock.unlock(); // !!! blq_lock released !!!
+      */
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "index: " << shard.get_hash() << " buffer to blq in radosWriteThread()"
@@ -1027,7 +1028,7 @@ int main(int argc, const char** argv) {
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "Shutdown: pending_buffers.size() is " << pending_buffers_size <<
-	  " in encode routine." << std::endl;
+	  " in writing routine." << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif

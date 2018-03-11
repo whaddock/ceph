@@ -50,8 +50,9 @@
 #include <cassert>
 #include <chrono>
 
-#define TRACE
+#define uint_32 unsigned long int
 #define RADOS_THREADS 0
+#define OPS_FACTOR 2
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
 #define THREAD_SLEEP_DURATION 25 // in millisecinds
 #define THREAD_ID  << "Thread: " << std::this_thread::get_id() << " | "
@@ -68,16 +69,17 @@
 int iterations = 0;
 int queue_size = 0;
 int object_size = 0;
+int stripe_size = 0;
 std::string obj_name;
 std::string pool_name;
 int ret = 0;
 bool failed = false; // Used as a flag to indicate that a failure has occurred
-int rados = 1; // Enable extended rados benchmarks. If false, only original erasure code benchmarks.
+int rados_mode = 1; // Enable extended rados benchmarks. If false, only original erasure code benchmarks.
 int _argc; // Global argc for threads to use
 const char** _argv; // Global argv for threads to use
 const std::chrono::milliseconds thread_sleep_duration(THREAD_SLEEP_DURATION);
 const std::chrono::milliseconds blq_sleep_duration(BLQ_SLEEP_DURATION);
-
+librados::Rados rados;
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
@@ -101,6 +103,178 @@ std::mutex stripes_lock;
 std::mutex shards_lock;
 std::mutex pending_buffers_lock;
 
+// Object information. We stripe over these objects.
+struct obj_info {
+  string name;
+  size_t len;
+};
+map<int, obj_info> objs;
+
+/* Function to get the IO Context */
+void initRadosIO() {
+
+  // first, we create a Rados object and initialize it
+  ret = rados.init("admin"); // just use the client.admin keyring
+  if (ret < 0) { // let's handle any error that might have come back
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
+    output_lock.unlock();
+#endif
+    ret = EXIT_FAILURE;
+  } else {
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
+    output_lock.unlock();
+#endif
+  }
+
+  /*
+   * Now we need to get the rados object its config info. It can
+   * parse argv for us to find the id, monitors, etc, so let's just
+   * use that.
+   */
+  {
+    ret = rados.conf_parse_argv(_argc, _argv);
+    if (ret < 0) {
+      // This really can't happen, but we need to check to be a good citizen.
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
+      output_lock.unlock();
+#endif
+      ret = EXIT_FAILURE;
+    } else {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
+      output_lock.unlock();
+#endif
+      // We also want to apply the config file if the user specified
+      // one, and conf_parse_argv won't do that for us.
+      for (int i = 0; i < _argc; ++i) {
+	if ((strcmp(_argv[i], "-c") == 0) || (strcmp(_argv[i], "--conf") == 0)) {
+	  ret = rados.conf_read_file(_argv[i+1]);
+	  if (ret < 0) {
+	    // This could fail if the config file is malformed, but it'd be hard.
+#ifdef TRACE
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
+				<< "! error" << ret << std::endl;
+	    output_lock.unlock();
+#endif
+	    ret = EXIT_FAILURE;
+	  }
+	  break;
+	}
+      }
+    }
+  }
+
+  /*
+   * next, we actually connect to the cluster
+   */
+  {
+    ret = rados.connect();
+    if (ret < 0) {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
+      output_lock.unlock();
+#endif
+      ret = EXIT_FAILURE;
+    } else {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
+      output_lock.unlock();
+#endif
+    }
+  }
+
+  return;
+}
+
+/* Function used for bootstrap thread
+ */
+void bootstrapThread()
+{
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting bootstrapThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+  int index;
+
+  /*
+   * create an "IoCtx" which is used to do IO to a pool
+   */
+  librados::IoCtx io_ctx;
+  {
+    ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
+    if (ret < 0) {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+      output_lock.unlock();
+#endif
+      ret = EXIT_FAILURE;
+    } else {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "we just created an ioctx for our pool" << std::endl;
+      output_lock.unlock();
+#endif
+    }
+  }
+  if (ret < 0) {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "There was a failure. Bad return from initRadosIO.  " << ret << std::endl;
+      output_lock.unlock();
+#endif
+  }
+
+  int buf_len = 1;
+  bufferptr p = buffer::create(buf_len);
+  bufferlist bl;
+  memset(p.c_str(), 0, buf_len);
+  bl.push_back(p);
+
+  list<librados::AioCompletion *> completions;
+  for (index = 0; index < stripe_size; index++) {
+    obj_info info;
+    std::stringstream object_name;
+    object_name << obj_name << "." << index;
+    info.name = object_name.str();
+    info.len = iterations * object_size;
+    uint_32 max_ops = stripe_size * OPS_FACTOR;
+
+    // throttle...
+    while (completions.size() > max_ops) {
+      librados::AioCompletion *c = completions.front();
+      c->wait_for_complete();
+      ret = c->get_return_value();
+      c->release();
+      completions.pop_front();
+      if (ret < 0) {
+	cerr << "aio_write failed" << std::endl;
+      }
+    }
+
+    librados::AioCompletion *c = rados.aio_create_completion(NULL, NULL, NULL);
+    completions.push_back(c);
+    // generate object
+    ret = io_ctx.aio_write(info.name, c, bl, buf_len, info.len - buf_len);
+    if (ret < 0) {
+      cerr << "couldn't write obj: " << info.name << " ret=" << ret << std::endl;
+    }
+    objs[index] = info;
+  }
+}
+
 /* Function used for buffer list creation thread 
  */
 void bufferListCreatorThread() {
@@ -114,6 +288,7 @@ void bufferListCreatorThread() {
     std::cerr.flush();
     output_lock.unlock();
 #endif
+
   }
   for (int i=0;i<queue_size;i++) {
     librados::bufferlist bl;
@@ -220,13 +395,14 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
  */
 void radosWriteThread() {
   bool started = false;
+  librados::IoCtx io_ctx;
   list<librados::AioCompletion *> completions;
   int ret;
   // For this thread
-  librados::IoCtx io_ctx;
-
-  // first, we create a Rados object and initialize it
-  librados::Rados rados;
+  uint_32 shard_counter = 0;
+  uint_32 stripe = 0;
+  uint_32 index = 0;
+  uint_32 offset = 0;
 
   if(!started) {
     started = true;
@@ -236,92 +412,7 @@ void radosWriteThread() {
     std::cerr.flush();
     output_lock.unlock();
 #endif
-    ret = rados.init("admin"); // just use the client.admin keyring
-    if (ret < 0) { // let's handle any error that might have come back
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
-      output_lock.unlock();
-#endif
-      ret = EXIT_FAILURE;
-      goto out;
-    } else {
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
-      output_lock.unlock();
-#endif
-    }
 
-    /*
-     * Now we need to get the rados object its config info. It can
-     * parse argv for us to find the id, monitors, etc, so let's just
-     * use that.
-     */
-    {
-      ret = rados.conf_parse_argv(_argc, _argv);
-      if (ret < 0) {
-	// This really can't happen, but we need to check to be a good citizen.
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
-	output_lock.unlock();
-#endif
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
-	output_lock.unlock();
-#endif
-	// We also want to apply the config file if the user specified
-	// one, and conf_parse_argv won't do that for us.
-	for (int i = 0; i < _argc; ++i) {
-	  if ((strcmp(_argv[i], "-c") == 0) || (strcmp(_argv[i], "--conf") == 0)) {
-	    ret = rados.conf_read_file(_argv[i+1]);
-	    if (ret < 0) {
-	      // This could fail if the config file is malformed, but it'd be hard.
-#ifdef TRACE
-	      output_lock.lock();
-	      std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
-				  << "! error" << ret << std::endl;
-	      output_lock.unlock();
-#endif
-	      ret = EXIT_FAILURE;
-	      goto out;
-	    }
-	    break;
-	  }
-	}
-      }
-    }
-
-    /*
-     * next, we actually connect to the cluster
-     */
-    {
-      ret = rados.connect();
-      if (ret < 0) {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
-	output_lock.unlock();
-#endif
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
-	output_lock.unlock();
-#endif
-      }
-    }
-
-    /*
-     * create an "IoCtx" which is used to do IO to a pool
-     */
     {
       ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
       if (ret < 0) {
@@ -331,7 +422,6 @@ void radosWriteThread() {
 	output_lock.unlock();
 #endif
 	ret = EXIT_FAILURE;
-	goto out;
       } else {
 #ifdef TRACE
 	output_lock.lock();
@@ -340,6 +430,15 @@ void radosWriteThread() {
 #endif
       }
     }
+    if (ret < 0) {
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "There was a failure. Bad return from initRadosIO.  " << ret << std::endl;
+      output_lock.unlock();
+#endif
+    }
+
+
   }
 
   // Write loop 
@@ -372,14 +471,27 @@ void radosWriteThread() {
 #endif
 
     if (!pending_buffers.empty()) {
-      /* This code only executes if there are any Shards in pending_buffers */
+      /* This code only executes if there are any Shards in pending_buffers.
+         Buffers are insereted into the pending_buffers queue in order from
+         the erasure encoded stripe. We can derive the stripe and shard by
+         keeping up with this position. We will use it to append to the objects
+	 that are created at the beginning, like it is done in the rados bench
+	 tool.
+      */
       do_write = true; // We have a buffer to write.
       shard = pending_buffers.front();
       pending_buffers.pop();
+      shard_counter += 1;
+      stripe = shard_counter / stripe_size;
+      offset = stripe * object_size;
+      index = shard_counter % stripe_size;
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID  << "pbit: Writing " << shard.get_object_name()
 			   << " to storage." << std::endl;
+      std::cerr THREAD_ID  << "shard: " << shard << " stripe: " << stripe
+			   << " offset: " << offset << " ObjectID: "
+			   << objs[index].name << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -403,7 +515,7 @@ void radosWriteThread() {
       output_lock.unlock();
 #endif
       // throttle...
-      while (completions.size() > concurrentios) {
+      while (completions.size() > (uint_32)concurrentios) {
 	librados::AioCompletion *c = completions.front();
 	c->wait_for_complete();
 	ret = c->get_return_value();
@@ -419,7 +531,7 @@ void radosWriteThread() {
       completions.push_back(c);
 
       librados::bufferlist _bl = shard.get_bufferlist();
-      ret = io_ctx.aio_write_full(shard.get_object_name(),c,_bl);
+      ret = io_ctx.aio_write(objs[index].name,c,_bl,object_size,offset);
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "Write called."
@@ -435,7 +547,6 @@ void radosWriteThread() {
 #endif
 	ret = EXIT_FAILURE;
 	failed = true; 
-	goto out;
 	// We have had a failure, so do not execute any further, 
 	// fall through.
       }
@@ -467,7 +578,6 @@ void radosWriteThread() {
     }
   }   // End Write loop
 
- out:
   list<librados::AioCompletion *>::iterator iter;
   for (iter = completions.begin(); iter != completions.end(); ++iter) {
     librados::AioCompletion *c = *iter;
@@ -509,7 +619,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   std::cerr << "Added help,verbose,name" << std::endl;
   std::cerr.flush();
   desc.add_options()
-    ("rados,r", po::value<int>()->default_value(1),
+    ("rados_mode,r", po::value<int>()->default_value(1),
      "Enables rados benchmarks. If false, original EC benchmarks.") 
     ("size,s", po::value<int>()->default_value(1024 * 1024),
      "size of the buffer to be encoded")
@@ -613,7 +723,7 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   }
 
   in_size = vm["size"].as<int>();
-  rados = vm["rados"].as<int>();
+  rados_mode = vm["rados_mode"].as<int>();
   concurrentios = vm["threads"].as<int>();
   queue_size = vm["queuesize"].as<int>();
   object_size = vm["object_size"].as<int>(); 
@@ -851,7 +961,6 @@ int ErasureCodeBench::decode()
 
 int main(int argc, const char** argv) {
   ErasureCodeBench ecbench;
-  int stripe_size = 0;
 
   // variables used for timing
   utime_t end_time;
@@ -869,7 +978,7 @@ int main(int argc, const char** argv) {
     return 1;
   }
   START_TIMER; // Code for the begin_time
-  if (rados == 0) {
+  if (rados_mode == 0) {
     iterations = ecbench.max_iterations;
     stripe_size = ecbench.stripe_size;
     queue_size = ecbench.queue_size;

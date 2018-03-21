@@ -51,7 +51,12 @@
 #include <chrono>
 
 #define uint_32 unsigned long int
-#define RADOS_THREADS 0
+#define RADOS_THREADS 1
+
+#ifndef EC_THREADS
+#define EC_THREADS 10
+#endif
+
 #define OPS_FACTOR 2
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
 #define THREAD_SLEEP_DURATION 25 // in millisecinds
@@ -87,6 +92,7 @@ std::queue<map<int,Shard>> stripes;
 std::queue<Shard> pending_buffers;
 std::map<int,Shard> shards;
 std::vector<std::thread> rados_threads;
+std::vector<std::thread> v_ec_threads;
 std::thread ecThread;
 std::thread blThread;
 bool ec_done = false; //Becomes true at the end when we all ec operations are completed
@@ -94,6 +100,7 @@ bool reading_done = false; //Becomes true at the end when we all objects in pend
 bool writing_done = false; //Becomes true at the end when we all objects in pending_buffer are written
 int pending_buffers_that_remain = 0;
 int concurrentios = RADOS_THREADS;
+int ec_threads = EC_THREADS;
 int blq_last_size = 0;
 
 // Locks for containers sharee with the handleAioCompletions thread.
@@ -598,10 +605,11 @@ void radosWriteThread() {
       output_lock.unlock();
 #endif
 
-      // Keep the Shards in a map in case we want to read the buffers back.
+      /* Keep the Shards in a map in case we want to read the buffers back.
       shards_lock.lock();
       shards.insert(pair<int,Shard>(shard.get_hash(),shard));
       shards_lock.unlock();
+      */
     } // End of the do_write block.
     else {
       /* The pending_buffer map is empty, sleep a few milliseconds. */
@@ -1060,8 +1068,12 @@ int main(int argc, const char** argv) {
     // Start the bufferListCreatorThread
     blThread = std::thread (bufferListCreatorThread);
 
-    // Start the erasureEncodeThread
-    ecThread = std::thread (erasureEncodeThread, ecbench);
+    // Start the erasureEncodeThread. Only do one thread with Gibraltar
+    if (ecbench.plugin == "gibraltar") 
+      ec_threads = 1;
+    for (int i = 0;i<ec_threads;i++) {
+      v_ec_threads.push_back(std::thread (erasureEncodeThread, ecbench));
+    }
 
     // RADOS IO Test Here
     /*
@@ -1172,7 +1184,8 @@ int main(int argc, const char** argv) {
       output_lock.unlock();
 #endif
 
-      ecThread.join();     // Wait for the ecThread to finish.
+      for (int i = 0;i<ec_threads;i++) 
+	v_ec_threads[i].join();     // Wait for the ecThread to finish.
       blThread.join(); // This should have finished at the beginning.
 
       /* If we get here, then all of the erasure coded buffers will be in the

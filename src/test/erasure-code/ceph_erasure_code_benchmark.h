@@ -31,7 +31,7 @@ public:
   int m;
   int stripe_size;
   int queue_size;
-  int object_size;
+  int shard_size;
   string obj_name;
   string pool_name;
   string plugin;

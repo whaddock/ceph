@@ -34,6 +34,10 @@ class Shard {
     return bl;
   }
 
+  librados::bufferlist* get_bufferlist_ptr() {
+    return &bl;
+  }
+
   void set_bufferlist(librados::bufferlist _bl) {
     bl = _bl;
   }

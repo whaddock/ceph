@@ -50,12 +50,13 @@
 #include <cassert>
 #include <chrono>
 
+#define TRACE
 #define RADOS_THREADS 1
 
 #ifndef EC_THREADS
 #define EC_THREADS 10
 #endif
-
+#define BLCTHREADS 10
 #define OPS_FACTOR 2
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
 #define THREAD_SLEEP_DURATION 25 // in millisecinds
@@ -95,10 +96,12 @@ std::queue<Shard> pending_buffers;
 std::map<int,Shard> shards;
 std::vector<std::thread> rados_threads;
 std::vector<std::thread> v_ec_threads;
+std::vector<std::thread> v_blc_threads;
 std::thread ecThread;
 std::thread blThread;
 std::thread ccThread;
 bool is_encoding = false;
+bool aio_done = false; //Becomes true at the end when we all aio operations are completed
 bool ec_done = false; //Becomes true at the end when we all ec operations are completed
 bool reading_done = false; //Becomes true at the end when we all stripes in the stripes_decode queue are repaired.
 bool writing_done = false; //Becomes true at the end when we all objects in pending_buffer are written
@@ -106,9 +109,9 @@ int pending_buffers_that_remain = 0;
 int stripes_that_remain = 0;
 int concurrentios = RADOS_THREADS;
 int ec_threads = EC_THREADS;
-int blq_last_size = 0;
 int K = 0; // Number of data shards
 int M = 0; // Number of erasure code shards
+uint32_t buffers_created_count = 0;
 std::vector<int> v_erased;
 
 // Locks for containers sharee with the handleAioCompletions thread.
@@ -308,7 +311,7 @@ void bootstrap()
  */
 void bufferListCreatorThread() {
   bool started = false;
-  uint32_t count = 0;
+  int blq_last_size = 0;
 
   if(!started) {
     started = true;
@@ -322,10 +325,10 @@ void bufferListCreatorThread() {
   }
   blq_last_size = 0; // there are not any yet
   while (!ec_done) {
-    while (blq_last_size < queue_size) {
+    if (blq_last_size < queue_size) {
       librados::bufferlist bl;
       if (is_encoding) { // encoding/writing case
-	bl.append(std::string(shard_size,(char)count++%26+97)); // start with 'a'
+	bl.append(std::string(shard_size,(char)buffers_created_count%26+97)); // start with 'a'
       }
       else {
 	bl.append(std::string(shard_size,(char)20)); // Buffers for read, use space character
@@ -333,46 +336,49 @@ void bufferListCreatorThread() {
       blq_lock.lock(); // *** blq_lock acquired ***
       blq.push(bl);
       blq_last_size = blq.size();
+      buffers_created_count++;
       blq_lock.unlock(); // !!! blq_lock released !!!
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "\tCurrently there are " << blq_last_size 
 			  << " buffers in the queue."
 			  << std::endl
-			  << "\tTotal buffers created: " << count << std::endl;
+		THREAD_ID << "\tTotal buffers created: " << buffers_created_count << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
-      std::this_thread::sleep_for(thread_sleep_duration);
     }
-    output_lock.lock();
-    std::cerr THREAD_ID << "Stopping ec thread, ec_done is true."
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::this_thread::sleep_for(thread_sleep_duration);
   }
+  output_lock.lock();
+  std::cerr THREAD_ID << "Stopping ec thread, ec_done is true."
+		      << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
 }
 
 /* Collect completions as they finish */
-void completionsCollectionThread() {
+void readCompletionsCollectionThread() {
   librados::AioCompletion *c;
   uint32_t count = 0;
   std::map<int,Shard> stripe;
   bool started = false;
   bool waiting_on_stripe = false;
+  bool completions_empty = false;
+  bool wait_for_shard = false;
 
   if(!started) {
     started = true;
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID << "Starting completionsCollectionThread()" << std::endl;
+    std::cerr THREAD_ID << "Starting readCompletionsCollectionThread()" << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
   }
 
   // Run until all erasure coding operations are finished.
-  while (!ec_done) { 
+  while (!aio_done) { 
     /* 1. count is monotonically increasing.
      * 2. if we are only reading, stripes will get pushed onto
      *    the stripes_read queue as they are being read.
@@ -381,38 +387,104 @@ void completionsCollectionThread() {
      *    done reading and ready for decoding.
      */
     waiting_on_stripe = false;
-    stripes_read_lock.lock(); // *** Get stripes read lock
+    stripes_read_lock.lock(); // *** Get stripes read lock ***
     if (!stripes_read.empty()) {
       waiting_on_stripe = true;
       stripe = stripes_read.front();
       stripes_read.pop();
     }
-    stripes_read_lock.unlock(); // *** Release stripes read lock
+    stripes_read_lock.unlock(); // !!! Release stripes read lock !!!
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Checked stripes_read queue." << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
 
     count = 0;
-    while(waiting_on_stripe && !completions.empty() 
-	  && count <= (uint32_t)K) {
-      completions_lock.lock(); // *** Get completions lock
-      c = completions.front();
-      completions.pop_front();
-      completions_lock.unlock(); // *** Release completions lock
+    completions_empty = false;
+    while(waiting_on_stripe && !completions_empty
+	  && count < (uint32_t)K) {
+      completions_lock.lock(); // *** Get completions lock ***
+      if (completions.empty()) 
+	completions_empty = true;
+      if (!completions_empty) {
+	c = completions.front();
+	completions.pop_front();
+	wait_for_shard = true;
+	completions_empty = false;
+      }
+      completions_lock.unlock(); // !!! Release completions lock !!!
 
-      c->wait_for_complete();
-      ret = c->get_return_value();
-      c->release();
-      count++;
-      if (ret < 0) {
-	cerr << "aio_write failed" << std::endl;
-	return;
+      if (wait_for_shard) {
+	wait_for_shard = false;
+	c->wait_for_complete();
+	ret = c->get_return_value();
+	c->release();
+	count++;
+	if (ret < 0) {
+	  cerr << "aio_write failed" << std::endl;
+	  return;
+	}
       }
     }
+    // We have finished K shards in the stripe.
     if (waiting_on_stripe) {
+      waiting_on_stripe = false;
       stripes_decode_lock.lock(); // *** Get stripes decode lock
       stripes_decode.push(stripe);
       stripes_decode_lock.unlock(); // *** Release stripes decode lock
     }
+    else {
+      std::this_thread::sleep_for(thread_sleep_duration);
+    }
   }
-} // End of completionsCollectionThread
+} // End of readCompletionsCollectionThread
+
+  /* Collect completions as they finish */
+void writeCompletionsCollectionThread() {
+  librados::AioCompletion *c;
+  bool started = false;
+  bool completions_empty = false;
+  bool wait_for_shard = false;
+
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting writeCompletionsCollectionThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+  }
+
+  // Run until all erasure coding operations are finished.
+  while (!aio_done) { 
+    completions_empty = false;
+    completions_lock.lock(); // *** Get completions lock
+    if (completions.empty())
+      completions_empty = true;
+    if (!completions_empty) {
+      c = completions.front();
+      completions.pop_front();
+      wait_for_shard = true;
+      completions_empty = false;
+    }
+    completions_lock.unlock(); // *** Release completions lock
+    if (wait_for_shard) {
+      c->wait_for_complete();
+      ret = c->get_return_value();
+      c->release();
+      wait_for_shard = false;
+      if (ret < 0) { // yes, we leak.
+	cerr << "aio_write failed" << std::endl;
+	return;
+      }
+    }
+    else
+      std::this_thread::sleep_for(thread_sleep_duration);
+  }
+} // End of writeCompletionsCollectionThread
 
 /* Function used to perform erasure encoding.
  */
@@ -423,7 +495,6 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
   map<int,Shard> stripe;
   map<int,Shard>::iterator stripe_it;
   map<int,librados::bufferlist> encoded;
-  map<int,librados::bufferlist>::iterator shard_it;
 
   if(!started) {
     started = true;
@@ -448,14 +519,14 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 	   stripe_it!=stripe.end();stripe_it++) {
 	encoded.insert(pair<int,librados::bufferlist>(stripe_it->second.get_shard(),stripe_it->second.get_bufferlist()));
       }
-      ret = ecbench.encode(&encoded);
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Stripe " <<  stripe.begin()->second.get_stripe() << " encoded in erasureCodeThread()" << 
+      std::cerr THREAD_ID << "Stripe " <<  stripe.begin()->second.get_stripe() << " calling encode in erasureCodeThread()" << 
 	std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
+      ret = ecbench.encode(&encoded);
       pending_buffers_lock.lock(); // *** pending_buffers_lock acquired ***
 #ifdef TRACE
       output_lock.lock();
@@ -502,7 +573,6 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
   map<int,Shard> stripe;
   map<int,Shard>::iterator stripe_it;
   map<int,librados::bufferlist> encoded;
-  map<int,librados::bufferlist>::iterator shard_it;
 
   if(!started) {
     started = true;
@@ -700,21 +770,15 @@ void radosWriteThread() {
     } // End of the do_write block.
     else {
       /* The pending_buffer map is empty, sleep a few milliseconds. */
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Write thread sleeping now." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
       std::this_thread::sleep_for(thread_sleep_duration);
     }
   }   // End Write loop
-
-  list<librados::AioCompletion *>::iterator iter;
-  for (iter = completions.begin(); iter != completions.end(); ++iter) {
-    librados::AioCompletion *c = *iter;
-    c->wait_for_complete();
-    ret = c->get_return_value();
-    c->release();
-    if (ret < 0) { // yes, we leak.
-      cerr << "aio_write failed" << std::endl;
-      return;
-    }
-  }
 
   // clean up the bufferlist queue
   blq_lock.lock(); // *** blq_lock acquired ***
@@ -820,17 +884,35 @@ void radosReadThread() {
     if (do_read) {
       /* This code only executes if a stripe was found in the stripes queue. */
       // throttle... *** We need to do this differently because we must repair the stripe
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Starting do_read in radosReadThread." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
       completions_size = UINT_MAX;
       while (completions_size > (uint32_t)concurrentios) {
-	completions_lock.lock(); // Get completions lock
+	completions_lock.lock(); // *** Get completions lock ***
 	completions_size = completions.size();
-	completions_lock.lock(); // Get completions lock
+	completions_lock.unlock(); // !!! completions lock released !!!
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "completions_size is " << completions_size << " in radosReadThread." << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
 	if (completions_size > (uint32_t)concurrentios)
 	  std::this_thread::sleep_for(thread_sleep_duration);
       }
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "completions_size < conncurrentios in radosReadThread." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
 
       /* Need to design this. We only want to readk K shards determined by the
-       * input parameters. Then we wait in the completionsCollectionThread for
+       * input parameters. Then we wait in the readCompletionsCollectionThread for
        * the reads to complete before passing them on to the erasure code thread.
        */
       uint32_t count = 0;
@@ -882,10 +964,16 @@ void radosReadThread() {
 	    // fall through.
 	  }
 	}
+	// Put the stripe in the stripes_read queue
+	stripes_read_lock.lock(); // *** Get stripes read lock
+	if (!stripes_read.empty()) {
+	  stripes_read.push(stripeM);
+	}
+	stripes_read_lock.unlock(); // *** Release stripes read lock
       }
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "index: " << shard.get_hash() << " buffer read started in radosReadThread()"
+      std::cerr THREAD_ID << "index: " << shard.get_hash() << " stripe read started in radosReadThread()"
 			  << std::endl;
       std::cerr THREAD_ID << "we are reading "
 			  << shard.get_object_name() 
@@ -1272,6 +1360,7 @@ int ErasureCodeBench::decode()
 
 int main(int argc, const char** argv) {
   ErasureCodeBench ecbench;
+  int blq_last_size = 0;
 
   // variables used for timing
   utime_t end_time;
@@ -1311,7 +1400,8 @@ int main(int argc, const char** argv) {
     _argv = argv;
 
     // Start the bufferListCreatorThread
-    blThread = std::thread (bufferListCreatorThread);
+    for (int i=1;i<BLCTHREADS;i++) 
+      v_blc_threads.push_back(std::thread (bufferListCreatorThread));
 
     // Initialize rados
     initRadosIO();
@@ -1322,6 +1412,7 @@ int main(int argc, const char** argv) {
     // Start the radosWriteThread
     if (ecbench.workload == "encode") {
       // Run the object bootstrap
+      is_encoding = true;
       bootstrap();
       // Start the rados writer thread
       rados_threads.push_back(std::thread (radosWriteThread));
@@ -1329,6 +1420,8 @@ int main(int argc, const char** argv) {
       for (int i = 0;i<ec_threads;i++) {
 	v_ec_threads.push_back(std::thread (erasureEncodeThread, ecbench));
       }
+      // Start the writeCompletionsCollectionThread
+      ccThread = std::thread (writeCompletionsCollectionThread);
     } else {
       // Start the radosReadThread
       rados_threads.push_back(std::thread (radosReadThread));
@@ -1336,8 +1429,8 @@ int main(int argc, const char** argv) {
       for (int i = 0;i<ec_threads;i++) {
 	v_ec_threads.push_back(std::thread (erasureDecodeThread, ecbench));
       }
-      // Start the completionsCollectionThread
-      ccThread = std::thread (completionsCollectionThread);
+      // Start the readCompletionsCollectionThread
+      ccThread = std::thread (readCompletionsCollectionThread);
     }
 
     // RADOS IO Test Here
@@ -1390,10 +1483,10 @@ int main(int argc, const char** argv) {
 	  std::endl;
 	output_lock.unlock();
 #endif
-	stripes_lock.lock(); // *** stripes_lock acquired ***
-	stripes.push(stripe);
-	stripes_lock.unlock(); // !!! stripes_lock released !!!
       } 
+      stripes_lock.lock(); // *** stripes_lock acquired ***
+      stripes.push(stripe);
+      stripes_lock.unlock(); // !!! stripes_lock released !!!
     }
 
     FINISH_TIMER; // Compute total time since START_TIMER
@@ -1422,27 +1515,29 @@ int main(int argc, const char** argv) {
     output_lock.unlock();
 #endif
 
-    if (ecbench.workload == "encode") { // encoding/writing case
-      is_encoding = true;
-      while (!ec_done) {
-	stripes_lock.lock(); // *** stripes_lock acquired ***
-	if (stripes.empty())
-	  ec_done = true;
-	stripes_lock.unlock(); // !!! stripes_lock released !!!
-	if (!ec_done)
-	  std::this_thread::sleep_for(blq_sleep_duration);
-      }
+    while (!ec_done) {
+      stripes_lock.lock(); // *** stripes_lock acquired ***
+      if (stripes.empty())
+	ec_done = true;
+      stripes_lock.unlock(); // !!! stripes_lock released !!!
+      if (!ec_done)
+	std::this_thread::sleep_for(blq_sleep_duration);
+    }
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown: Done with erasure codiding." << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+    output_lock.lock();
+    std::cerr THREAD_ID << "Shutdown: Done with erasure codiding." << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
 #endif
 
-      for (int i = 0;i<ec_threads;i++) 
-	v_ec_threads[i].join();     // Wait for the ecThread to finish.
-      blThread.join(); // This should have finished at the beginning.
+    for (int i=1;i<BLCTHREADS;i++) 
+      v_blc_threads[i].join(); // This should have finished at the beginning.
 
+    for (int i = 0;i<ec_threads;i++) 
+      v_ec_threads[i].join();     // Wait for the ecThread to finish.
+
+    std::vector<std::thread>::iterator rit;
+    if (ecbench.workload == "encode") { // encoding/writing case
       /* If we get here, then all of the erasure coded buffers will be in the
        * pending_buffers map. We should not set writing_done until all of the
        * buffers have been written to the object store.
@@ -1473,12 +1568,52 @@ int main(int argc, const char** argv) {
       std::cerr.flush();
       output_lock.unlock();
 #endif
+    }
+    else {  // must be decoding and reading
+      /* READING: TODO: rewrite this If we get here, then all of the erasure coded buffers will be in the
+       * pending_buffers map. We should not set writing_done until all of the
+       * buffers have been written to the object store.
+       */
+      while (!reading_done) {
+	stripes_lock.lock();  // *** stripes_lock ***
+	stripes_that_remain = stripes.size();
+	stripes_lock.unlock(); // !!! stripes lock released !!!
+	if (stripes_that_remain < 1) 
+	  reading_done = true;
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Shutdown: stripes() is " << stripes_that_remain <<
+	  " in reading routine." << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
 
-      std::vector<std::thread>::iterator rit;
-      for (rit=rados_threads.begin();rit!=rados_threads.end();rit++) {
-	rit->join(); // Wait for writer to finish.
+	if (!reading_done)
+	  std::this_thread::sleep_for(blq_sleep_duration);
       }
-    } 
+
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Shutdown:Done with reading." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+    }
+    for (rit=rados_threads.begin();rit!=rados_threads.end();rit++) {
+      rit->join(); // Wait for writer to finish.
+    } // wait for the rados threads to finish.
+
+    uint32_t completions_size = UINT_MAX;
+    while (completions_size > 1) {
+      completions_lock.lock(); // *** Get completions lock ***
+      completions_size = completions.size();
+      completions_lock.unlock(); // !!! completions lock released !!!
+      if (completions_size > 1)
+	std::this_thread::sleep_for(blq_sleep_duration);
+      else
+	aio_done = true; // this should stop the completions collection thread
+    }
+    ccThread.join(); // All objects flushed.
 
     // Locking not required after this point.
     std::cerr THREAD_ID << "Shutdown: Wait for all writes to flush." << std::endl;

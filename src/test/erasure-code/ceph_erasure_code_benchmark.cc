@@ -140,6 +140,7 @@ void initRadosIO() {
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
+    std::cerr.flush();
     output_lock.unlock();
 #endif
     ret = EXIT_FAILURE;
@@ -147,6 +148,7 @@ void initRadosIO() {
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
+    std::cerr.flush();
     output_lock.unlock();
 #endif
   }
@@ -163,6 +165,7 @@ void initRadosIO() {
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       ret = EXIT_FAILURE;
@@ -170,6 +173,7 @@ void initRadosIO() {
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       // We also want to apply the config file if the user specified
@@ -183,6 +187,7 @@ void initRadosIO() {
 	    output_lock.lock();
 	    std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
 				<< "! error" << ret << std::endl;
+	    std::cerr.flush();
 	    output_lock.unlock();
 #endif
 	    ret = EXIT_FAILURE;
@@ -202,6 +207,7 @@ void initRadosIO() {
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       ret = EXIT_FAILURE;
@@ -209,6 +215,7 @@ void initRadosIO() {
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
     }
@@ -239,6 +246,7 @@ void bootstrap()
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       ret = EXIT_FAILURE;
@@ -246,6 +254,7 @@ void bootstrap()
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "we just created an ioctx for our pool" << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
     }
@@ -254,6 +263,7 @@ void bootstrap()
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "There was a failure. Bad return from initRadosIO.  " << ret << std::endl;
+    std::cerr.flush();
     output_lock.unlock();
 #endif
   }
@@ -416,6 +426,12 @@ void readCompletionsCollectionThread() {
       }
       completions_lock.unlock(); // !!! Release completions lock !!!
 
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Waiting for shard: " << wait_for_shard << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
       if (wait_for_shard) {
 	wait_for_shard = false;
 	c->wait_for_complete();
@@ -541,6 +557,7 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
       output_lock.lock();
 	std::cerr THREAD_ID << "Pushed buffer " << stripe_it->second.get_hash() <<
 	  " to pending_buffer_queue."  << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       }
@@ -650,6 +667,7 @@ void radosWriteThread() {
 #ifdef TRACE
 	 output_lock.lock();
 	 std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+	 std::cerr.flush();
 	 output_lock.unlock();
 #endif
 	ret = EXIT_FAILURE;
@@ -728,6 +746,7 @@ void radosWriteThread() {
       std::cerr THREAD_ID << "index: " << shard.get_hash()
 			  << " pending buffer erased in radosWriteThread()"
 			  << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       librados::AioCompletion *c = rados.aio_create_completion(NULL, NULL, NULL);
@@ -741,6 +760,7 @@ void radosWriteThread() {
       output_lock.lock();
       std::cerr THREAD_ID << "Write called."
 			  << std::endl;
+      std::cerr.flush();
       output_lock.unlock();
 #endif
       if (ret < 0) {
@@ -748,6 +768,7 @@ void radosWriteThread() {
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't start write object! error at index "
 			    << shard.get_hash() << std::endl;
+	std::cerr.flush();
 	output_lock.unlock();
 #endif
 	ret = EXIT_FAILURE;
@@ -831,6 +852,7 @@ void radosReadThread() {
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+	std::cerr.flush();
 	output_lock.unlock();
 #endif
 	ret = EXIT_FAILURE;
@@ -949,6 +971,7 @@ void radosReadThread() {
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "Read called."
 			      << std::endl;
+	  std::cerr.flush();
 	  output_lock.unlock();
 #endif
 	  if (ret < 0) {
@@ -956,6 +979,7 @@ void radosReadThread() {
 	    output_lock.lock();
 	    std::cerr THREAD_ID << "couldn't start read object! error at index "
 				<< shard.get_hash() << std::endl;
+	    std::cerr.flush();
 	    output_lock.unlock();
 #endif
 	    ret = EXIT_FAILURE;
@@ -966,9 +990,7 @@ void radosReadThread() {
 	}
 	// Put the stripe in the stripes_read queue
 	stripes_read_lock.lock(); // *** Get stripes read lock
-	if (!stripes_read.empty()) {
-	  stripes_read.push(stripeM);
-	}
+	stripes_read.push(stripeM);
 	stripes_read_lock.unlock(); // *** Release stripes read lock
       }
 #ifdef TRACE
@@ -1481,6 +1503,7 @@ int main(int argc, const char** argv) {
 	output_lock.lock();
 	std::cerr THREAD_ID << "Created a Shard for encoding with hash value " << data.get_hash() << 
 	  std::endl;
+	std::cerr.flush();
 	output_lock.unlock();
 #endif
       } 
@@ -1532,9 +1555,6 @@ int main(int argc, const char** argv) {
 
     for (int i=1;i<BLCTHREADS;i++) 
       v_blc_threads[i].join(); // This should have finished at the beginning.
-
-    for (int i = 0;i<ec_threads;i++) 
-      v_ec_threads[i].join();     // Wait for the ecThread to finish.
 
     std::vector<std::thread>::iterator rit;
     if (ecbench.workload == "encode") { // encoding/writing case
@@ -1599,10 +1619,6 @@ int main(int argc, const char** argv) {
       output_lock.unlock();
 #endif
     }
-    for (rit=rados_threads.begin();rit!=rados_threads.end();rit++) {
-      rit->join(); // Wait for writer to finish.
-    } // wait for the rados threads to finish.
-
     uint32_t completions_size = UINT_MAX;
     while (completions_size > 1) {
       completions_lock.lock(); // *** Get completions lock ***
@@ -1614,6 +1630,13 @@ int main(int argc, const char** argv) {
 	aio_done = true; // this should stop the completions collection thread
     }
     ccThread.join(); // All objects flushed.
+
+    for (rit=rados_threads.begin();rit!=rados_threads.end();rit++) {
+      rit->join(); // Wait for writer to finish.
+    } // wait for the rados threads to finish.
+
+    for (int i = 0;i<ec_threads;i++) 
+      v_ec_threads[i].join();     // Wait for the ecThread to finish.
 
     // Locking not required after this point.
     std::cerr THREAD_ID << "Shutdown: Wait for all writes to flush." << std::endl;

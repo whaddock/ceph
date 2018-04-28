@@ -40,6 +40,7 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <climits>
 #include <ctime>
 #include <stdio.h>
 #include <deque>
@@ -50,11 +51,13 @@
 #include <cassert>
 #include <chrono>
 
+#define TRACE
 #define RADOS_THREADS 1
 
 #ifndef EC_THREADS
 #define EC_THREADS 10
 #endif
+#define MAX_STRIPE_QUEUE_SIZE 20
 #define BLCTHREADS 10
 #define OPS_FACTOR 2
 #define BLQ_SLEEP_DURATION 100 // in millisecinds
@@ -363,6 +366,9 @@ void bufferListCreatorThread(ErasureCodeBench ecbench) {
 #endif
     }
     std::this_thread::sleep_for(thread_sleep_duration);
+    blq_lock.lock(); // *** blq_lock acquired ***
+    blq_last_size = blq.size();
+    blq_lock.unlock(); // !!! blq_lock released !!!
   }
   output_lock.lock();
   std::cerr THREAD_ID << "bufferListCreator thread, all buffers created."
@@ -378,8 +384,9 @@ void readCompletionsCollectionThread() {
   bool started = false;
   bool waiting_on_stripe = true;
   bool completions_empty = false;
-  uint32_t stripes_read_size = 0;
   uint32_t completions_size = 0;
+  int stripes_decode_size = INT_MAX;
+
   if(!started) {
     started = true;
 #ifdef TRACE
@@ -400,25 +407,25 @@ void readCompletionsCollectionThread() {
      * 4. A stripe will have K shards read. Everytime we count 
      *    K completions, a stripe is done reading and for decoding.
      */
-    while (waiting_on_stripe && !aio_done) {
+    while ( waiting_on_stripe && !aio_done) {
       std::this_thread::sleep_for(thread_sleep_duration);
       stripes_read_lock.lock(); // *** Get stripes read lock ***
       waiting_on_stripe = stripes_read.empty();
       stripes_read_lock.unlock(); // !!! Release stripes read lock !!!
     }
+
     if (aio_done) break; // Guard in the event that aio finished while waiting for a stripe
     // If stripes_read is not empty, then the following is safe.
     stripes_read_lock.lock(); // *** Get stripes read lock ***
     stripe = stripes_read.front();
     stripes_read.pop();
-    stripes_read_size = stripes_read.size();
     waiting_on_stripe = stripes_read.empty();
     stripes_read_lock.unlock(); // !!! Release stripes read lock !!!
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Checked stripes_read queue." << std::endl;
-    std::cerr THREAD_ID << "stripes_read queue size is: "
-			<< stripes_read_size << std::endl;
+    std::cerr THREAD_ID << "Stripes Decode Queue size is: "
+			<< stripes_decode_size << std::endl;
     std::cerr.flush();
     output_lock.unlock();
 #endif
@@ -457,6 +464,13 @@ void readCompletionsCollectionThread() {
 	c->release();
       }
     } // End of shard for loop
+    // Limit the size of the stripes decode queue
+    while ( stripes_decode_size > MAX_STRIPE_QUEUE_SIZE ) {
+      std::this_thread::sleep_for(thread_sleep_duration);
+      stripes_decode_lock.lock(); // *** Get stripes read lock ***
+      stripes_decode_size = stripes_decode.size();
+      stripes_decode_lock.unlock(); // !!! Release stripes read lock !!!
+    }
     // We have finished K shards in the stripe.
     stripes_decode_lock.lock(); // *** Get stripes decode lock
     stripes_decode.push(stripe);
@@ -956,6 +970,7 @@ void radosReadThread() {
   librados::IoCtx io_ctx;
   int ret;
   int index = 0;
+  int stripes_read_size = INT_MAX;
   // For this thread
   uint32_t stripe = 0;
   uint32_t offset = 0;
@@ -1109,9 +1124,17 @@ void radosReadThread() {
 	std::this_thread::sleep_for(thread_sleep_duration);
       }
     }
+    // Keep the number of stripes less than MAX_STRIPE_QUEUE_SIZE
+    while (stripes_read_size > MAX_STRIPE_QUEUE_SIZE) {
+      std::this_thread::sleep_for(thread_sleep_duration);
+      stripes_read_lock.lock(); // *** Get stripes read 
+      stripes_read_size = stripes_read.size();
+      stripes_read_lock.unlock(); // *** Release stripes read lock
+    }
     // Put the stripe in the stripes_read queue
     stripes_read_lock.lock(); // *** Get stripes read 
     stripes_read.push(stripeM);
+    stripes_read_size = stripes_read.size();
     stripes_read_lock.unlock(); // *** Release stripes read lock
 #ifdef TRACE
     output_lock.lock();
@@ -1119,6 +1142,8 @@ void radosReadThread() {
 			<< std::endl;
     std::cerr THREAD_ID << "we are reading "
 			<< shard.get_object_name() 
+			<< std::endl;
+    std::cerr THREAD_ID << "Stripes Read Queue Size: " << stripes_read_size
 			<< std::endl;
     std::cerr.flush();
     output_lock.unlock();
@@ -1512,6 +1537,7 @@ int main(int argc, const char** argv) {
   utime_t begin_time;
   utime_t total_time_s;
   utime_t total_run_time_s;
+  int stripe_queue_size = INT_MAX;
 
   try {
     int err = ecbench.setup(argc, argv);
@@ -1595,6 +1621,13 @@ int main(int argc, const char** argv) {
     utime_t begin_time_final = ceph_clock_now(g_ceph_context);
     for (int j=0;j<iterations||failed;j++) {
       int index = 0;
+      while (stripe_queue_size > MAX_STRIPE_QUEUE_SIZE)
+	{
+	  std::this_thread::sleep_for(thread_sleep_duration);
+	  stripes_lock.lock(); // *** stripes_lock acquired ***
+	  stripe_queue_size = stripes.size();
+	  stripes_lock.unlock(); // !!! stripes_lock released !!!
+	}
       while (blq_last_size < stripe_size) {
 #ifdef TRACE
 	output_lock.lock();
@@ -1632,7 +1665,15 @@ int main(int argc, const char** argv) {
       } 
       stripes_lock.lock(); // *** stripes_lock acquired ***
       stripes.push(stripe);
+      stripe_queue_size = stripes.size();
       stripes_lock.unlock(); // !!! stripes_lock released !!!
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "Stripe Queue Size: " << stripe_queue_size
+			    << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
     }
 
     FINISH_TIMER; // Compute total time since START_TIMER

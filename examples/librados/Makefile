@@ -43,7 +43,7 @@ am__append_29 = -lbz2
 #am__append_30 = -llz4
 LIBERASURE_CODE = $(ceph_libs)/liberasure_code.a
 
-all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test rados_threaded_ec_write_test machine_threads 
+all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test machine_threads 
 
 librados_hello_world: hello_world.cc
 	g++ -g -c hello_world.cc -o hello_world.o $(CXXFLAGS)

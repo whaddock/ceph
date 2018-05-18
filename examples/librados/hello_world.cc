@@ -145,13 +145,31 @@ int main(int argc, const char **argv)
     }
   }
 
+  {
+    librados::bufferlist read_buf;
+    int read_len = 4194304; // this is way more than we need
+    // allocate the completion from librados
+    ret = io_ctx.read(object_name, read_buf, read_len, 0);
+    if (ret < 0) {
+      std::cerr << "couldn't start read object! error " << ret << std::endl;
+      ret = EXIT_FAILURE;
+      goto out;
+    } else {
+      std::cout << "we read our object " << object_name
+	  << ", and got back " << ret << " bytes with contents\n";
+      std::string read_string;
+      read_buf.copy(0, ret, read_string);
+      std::cout << read_string << std::endl;
+    }
+
+  }
   /*
    * now let's read that object back! Just for fun, we'll do it using
    * async IO instead of synchronous. (This would be more useful if we
    * wanted to send off multiple reads at once; see
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
-  {
+  if (false) {
     librados::bufferlist read_buf;
     int read_len = 4194304; // this is way more than we need
     // allocate the completion from librados

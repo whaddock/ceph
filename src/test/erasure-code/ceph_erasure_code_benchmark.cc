@@ -840,6 +840,7 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
       blq.push(stripe_it->second.get_bufferlist());
     }
     blq_last_size = blq.size();
+    buffers_created_count++;
     blq_lock.unlock(); // !!! blq_lock released !!!
 #ifdef TRACE
       output_lock.lock();
@@ -1728,19 +1729,22 @@ int main(int argc, const char** argv) {
     utime_t begin_time_final = ceph_clock_now(g_ceph_context);
     for (int j=0;j<iterations;j++) {
       int index = 0;
+      blq_last_size = INT_MIN; // Prime Read
       while (blq_last_size < stripe_size) {
-#ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
-			    << "Currently there are " << blq_last_size << " buffers in the queue."
-			    << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
-#endif
-	std::this_thread::sleep_for(blq_sleep_duration);
 	blq_lock.lock(); // *** blq_lock acquired ***
 	blq_last_size = blq.size();
 	blq_lock.unlock(); // !!! blq_lock released !!!
+	if (blq_last_size < stripe_size) {
+#ifdef TRACE
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Waiting for bufferlist queue to get enough buffers" << std::endl
+			      << "Currently there are " << blq_last_size << " buffers in the queue."
+			      << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+#endif
+	  std::this_thread::sleep_for(blq_sleep_duration);
+	}
       }
       std::map<int,Shard> stripe;
       for (int i=0;i<stripe_size;i++) {
@@ -1751,10 +1755,9 @@ int main(int argc, const char** argv) {
 	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
 	blq_lock.lock(); // *** blq_lock acquired ***
 	data.set_bufferlist(blq.front());
-	stripe.insert( std::pair<int,Shard>(i,data));
 	blq.pop(); // remove the bl from the queue
-	blq_last_size = blq.size();
 	blq_lock.unlock(); // !!! blq_lock released !!!
+	stripe.insert( std::pair<int,Shard>(i,data));
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "Created a Shard for encoding with hash value " << data.get_hash() << 

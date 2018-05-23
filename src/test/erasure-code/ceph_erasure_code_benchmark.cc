@@ -246,7 +246,6 @@ void bootstrapThread()
   std::cerr.flush();
   output_lock.unlock();
 #endif
-  int index;
 
   /*
    * create an "IoCtx" which is used to do IO to a pool
@@ -294,13 +293,10 @@ void bootstrapThread()
     output_lock.unlock();
 #endif
   list<librados::AioCompletion *> _completions;
-  for (index = 0; index < stripe_size; index++) {
-    obj_info info;
-    std::stringstream object_name;
-    object_name << obj_name << "." << index;
-    info.name = object_name.str();
-    info.len = iterations * shard_size;
-    uint32_t max_ops = stripe_size * OPS_FACTOR;
+  for (int index = 0; index < stripe_size; index++) {
+    objs_lock.lock(); // *** Get objs lock.
+    obj_info info = objs[index];
+    objs_lock.unlock(); // !!! Release objs lock.
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Creating object: " << object_name.str()
@@ -308,17 +304,6 @@ void bootstrapThread()
     std::cerr.flush();
     output_lock.unlock();
 #endif
-    // throttle...
-    while (_completions.size() > max_ops) {
-      librados::AioCompletion *c = _completions.front();
-      c->wait_for_complete();
-      ret = c->get_return_value();
-      c->release();
-      _completions.pop_front();
-      if (ret < 0) {
-	cerr << "aio_write failed" << std::endl;
-      }
-    }
 
     librados::AioCompletion *c = rados.aio_create_completion(NULL, NULL, NULL);
     _completions.push_back(c);
@@ -327,12 +312,8 @@ void bootstrapThread()
     if (ret < 0) {
       cerr << "couldn't write obj: " << info.name << " ret=" << ret << std::endl;
     }
-    objs_lock.lock(); // *** Get objs lock.
-    objs[index] = info;
-    objs_lock.unlock(); // !!! Release objs lock.
   }
   // Cleanup bootstrap
-  uint32_t count = 0;
   while (!_completions.empty()) {
     librados::AioCompletion *c = _completions.front();
 #ifdef TRACE
@@ -829,6 +810,7 @@ void radosWriteThread() {
   uint32_t stripe = 0;
   uint32_t index = 0;
   uint32_t offset = 0;
+  string name;
 
   if(!started) {
     started = true;
@@ -882,6 +864,9 @@ void radosWriteThread() {
     stripe = shard_counter / stripe_size;
     offset = stripe * shard_size;
     index = shard_counter % stripe_size;
+    objs_lock.lock(); // *** Get objs lock.
+    name = objs[index].name;
+    objs_lock.unlock(); // !!! Release objs lock.
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID  << "pbit: pending_buffers size (" << pending_buffers_size
@@ -891,11 +876,9 @@ void radosWriteThread() {
 			 << " Shard Object stripe position: " << shard.get_shard()
 			 << " Shard Object stripe number: " << shard.get_stripe()
 			 << " to storage." << std::endl;
-    objs_lock.lock(); // *** Get objs lock.
     std::cerr THREAD_ID  << "shard: " << shard_counter << " stripe: " << stripe
 			 << " offset: " << offset << " ObjectID: "
-			 << objs[index].name << std::endl;
-    objs_lock.unlock(); // !!! Release objs lock.
+			 << name << std::endl;
     std::cerr THREAD_ID << "index: " << shard.get_hash()
 			<< " In do_write. Pending buffer erased in radosWriteThread()"
 			<< std::endl;
@@ -910,9 +893,7 @@ void radosWriteThread() {
     completions_lock.unlock(); // *** Release completion lock
 
     librados::bufferlist _bl = shard.get_bufferlist();
-    objs_lock.lock(); // *** Get objs lock.
-    ret = io_ctx.aio_write(objs[index].name,c,_bl,shard_size,offset);
-    objs_lock.unlock(); // !!! Release objs lock.
+    ret = io_ctx.aio_write(name,c,_bl,shard_size,offset);
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Write called."
@@ -1623,7 +1604,19 @@ int main(int argc, const char** argv) {
     _argc = argc;
     _argv = argv;
 
-    // Start the bufferListCreatorThread
+    // Create the data structure for the objects we will use
+    for (int index = 0; index < stripe_size; index++) {
+      obj_info info;
+      std::stringstream object_name;
+      object_name << obj_name << "." << index;
+      info.name = object_name.str();
+      info.len = iterations * shard_size;
+      objs_lock.lock(); // *** Get objs lock.
+      objs[index] = info;
+      objs_lock.unlock(); // !!! Release objs lock.
+    }
+ 
+   // Start the bufferListCreatorThread
     for (int i=0;i<BLCTHREADS;i++) 
       v_blc_threads.push_back(std::thread (bufferListCreatorThread, ecbench));
 

@@ -15,6 +15,8 @@
 #include <iostream>
 #include <string>
 
+int shard_size = 16777216*2;
+
 int main(int argc, const char **argv)
 {
   int ret = 0;
@@ -127,8 +129,9 @@ int main(int argc, const char **argv)
      * until the bufferlist goes out of scope and any requests using it
      * have been finished!
      */
+    int buffers_created_count = 0;
     librados::bufferlist bl;
-    bl.append(hello);
+    bl.append(std::string(shard_size,(char)buffers_created_count%26+97)); // start with 'a'
 
     /*
      * now that we have the data to write, let's send it to an object.
@@ -152,8 +155,17 @@ int main(int argc, const char **argv)
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
   {
+    /*
+     * Prompt user so we wait to do the read.
+     */
+
+    std::string name;
+    std::cout << "Press enter when ready to proceed with read..." << std::endl;
+    std::getline(std::cin, name);
+    std::cout << "Proceeding to read object back..." << std::endl;
+
     librados::bufferlist read_buf;
-    int read_len = 4194304; // this is way more than we need
+    int read_len = shard_size;
     // allocate the completion from librados
     librados::AioCompletion *read_completion = librados::Rados::aio_create_completion();
     // send off the request.
@@ -174,7 +186,7 @@ int main(int argc, const char **argv)
       std::cout << "we read our object " << object_name
 	  << ", and got back " << ret << " bytes with contents\n";
       std::string read_string;
-      read_buf.copy(0, ret, read_string);
+      read_buf.copy(0, 20, read_string);
       std::cout << read_string << std::endl;
     }
   }

@@ -43,7 +43,7 @@ class Shard {
   }
 
   void dereference_bufferlist() {
-    bl = librados::bufferlist();
+    bl.zero();
   } // drop the reference to the bufferlist.
 
   void clear_read() {

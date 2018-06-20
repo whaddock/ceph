@@ -104,7 +104,7 @@ librados::Rados rados;
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<librados::bufferlist> blq;
-std::queue<map<int,Shard>> stripes, stripes_read, stripes_decode;
+std::queue<std::map<int,Shard>> stripes, stripes_read, stripes_decode;
 list<librados::AioCompletion *> completions, finishing;
 std::queue<Shard> pending_buffers,  write_buffers_waiting, finishing_buffers_waiting;
 std::map<int,Shard> shards;
@@ -150,7 +150,7 @@ struct obj_info {
   string name;
   size_t len;
 };
-map<int, obj_info> objs;
+std::map<int, obj_info> objs;
 
 /* Function to get the IO Context */
 void initRadosIO() {
@@ -400,7 +400,7 @@ void bufferListCreatorThread(ErasureCodeBench ecbench) {
 /* Collect completions as they finish */
 void readCompletionsCollectionThread(ErasureCodeBench ecbench) {
   librados::AioCompletion *c = NULL;
-  map<int,Shard>::iterator stripe_it;
+  std::map<int,Shard>::iterator stripe_it;
   bool started = false;
   bool stripes_read_empty = true;
   bool processing_stripe = true;
@@ -846,9 +846,9 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
   int ret = 0;
   int pending_buffers_size = INT_MAX;
   Shard shard;
-  map<int,Shard> stripe;
-  map<int,Shard>::iterator stripe_it;
-  map<int,librados::bufferlist> encoded;
+  std::map<int,Shard> stripe;
+  std::map<int,Shard>::iterator stripe_it;
+  std::map<int,librados::bufferlist> encoded;
 
   if(!started) {
     started = true;
@@ -949,9 +949,9 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
   int ret = 0;
   uint32_t stripes_decode_size = 0;
   Shard shard;
-  map<int,Shard> stripe;
-  map<int,Shard>::iterator stripe_it;
-  map<int,librados::bufferlist> encoded;
+  std::map<int,Shard> stripe;
+  std::map<int,Shard>::iterator stripe_it;
+  std::map<int,librados::bufferlist> encoded;
 
   if(!started) {
     started = true;
@@ -1059,12 +1059,12 @@ void radosWriteThread() {
   }
 
   // Write loop 
-  while (!writing_done) {
+  while (!aio_done) {
     // wait for the request to complete, and check that it succeeded.
     Shard shard;
 
     pending_buffers_empty = true; // Prime read
-    while (pending_buffers_empty && !writing_done) {
+    while (pending_buffers_empty && !aio_done) {
       processing_buffer = false;
       pending_buffers_lock.lock();  // *** pending_buffers_lock ***
       pending_buffers_empty = pending_buffers.empty();
@@ -1084,7 +1084,7 @@ void radosWriteThread() {
       if (pending_buffers_empty)
 	std::this_thread::sleep_for(thread_sleep_duration);
     }
-    if (writing_done && !processing_buffer)
+    if (aio_done && !processing_buffer)
       break;
 
     stripe = shard_counter / stripe_size;
@@ -1162,7 +1162,7 @@ void radosWriteThread() {
      * buffer once the write has completed.
      */
     uint32_t count = 0;
-    while (!writing_done && completions_size > concurrentios && count++ < 2) {
+    while (!aio_done && completions_size > concurrentios && count++ < 2) {
       std::this_thread::sleep_for(thread_sleep_duration);
 #ifdef TRACE
       output_lock.lock();
@@ -1178,7 +1178,7 @@ void radosWriteThread() {
     }
 #ifdef TRACE
     output_lock.lock();
-    std::cerr THREAD_ID << "completions_size is " << completions_size << " in radosReadThread."
+    std::cerr THREAD_ID << "completions_size is " << completions_size << " in radosWriteThread."
 			<< std::endl;
     std::cerr.flush();
     output_lock.unlock();
@@ -1236,8 +1236,8 @@ void radosReadThread(ErasureCodeBench ecbench) {
   uint32_t stripe = 0;
   uint32_t offset = 0;
   uint32_t completions_size = 0;
-  map<int,Shard> stripeM;
-  map<int,Shard>::iterator stripeM_it;
+  std::map<int,Shard> stripeM;
+  std::map<int,Shard>::iterator stripeM_it;
   Shard shard;
 
   if(!started) {
@@ -1641,7 +1641,7 @@ int ErasureCodeBench::encode()
   }
   utime_t begin_time = ceph_clock_now(g_ceph_context);
   for (int i = 0; i < max_iterations; i++) {
-    map<int,bufferlist> encoded;
+    std::map<int,bufferlist> encoded;
     int code = erasure_code->encode(want_to_encode, in, &encoded);
     if (code)
       return code;
@@ -1654,7 +1654,7 @@ int ErasureCodeBench::encode()
   return 0;
 }
 
-int ErasureCodeBench::encode(map<int, bufferlist> *encoded)
+int ErasureCodeBench::encode(std::map<int, bufferlist> *encoded)
 {
   set<int> want_to_encode;
   for (int i = 0; i < k + m; i++) {
@@ -1673,7 +1673,7 @@ int ErasureCodeBench::encode(map<int, bufferlist> *encoded)
   return 0;
 }
 
-static void display_chunks(const map<int,bufferlist> &chunks,
+static void display_chunks(const std::map<int,bufferlist> &chunks,
 			   unsigned int chunk_count) {
   cout << "chunks ";
   for (unsigned int chunk = 0; chunk < chunk_count; chunk++) {
@@ -1687,8 +1687,8 @@ static void display_chunks(const map<int,bufferlist> &chunks,
   cout << "(X) is an erased chunk" << endl;
 }
 
-int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
-				      const map<int,bufferlist> &chunks,
+int ErasureCodeBench::decode_erasures(const std::map<int,bufferlist> &all_chunks,
+				      const std::map<int,bufferlist> &chunks,
 				      unsigned i,
 				      unsigned want_erasures,
 				      ErasureCodeInterfaceRef erasure_code)
@@ -1703,7 +1703,7 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
       if (chunks.count(chunk) == 0)
 	want_to_read.insert(chunk);
 
-    map<int,bufferlist> decoded;
+    std::map<int,bufferlist> decoded;
     code = erasure_code->decode(want_to_read, chunks, &decoded);
     if (code)
       return code;
@@ -1726,7 +1726,7 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
   }
 
   for (; i < erasure_code->get_chunk_count(); i++) {
-    map<int,bufferlist> one_less = chunks;
+    std::map<int,bufferlist> one_less = chunks;
     one_less.erase(i);
     code = decode_erasures(all_chunks, one_less, i + 1, want_erasures - 1, erasure_code);
     if (code)
@@ -1736,7 +1736,7 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &all_chunks,
   return 0;
 }
 
-int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &chunks)
+int ErasureCodeBench::decode_erasures(const std::map<int,bufferlist> &chunks)
 {
   if (verbose)
     display_chunks(chunks, erasure_code->get_chunk_count());
@@ -1745,7 +1745,7 @@ int ErasureCodeBench::decode_erasures(const map<int,bufferlist> &chunks)
     if (chunks.count(chunk) == 0)
       want_to_read.insert(chunk);
 
-  map<int,bufferlist> decoded;
+  std::map<int,bufferlist> decoded;
   int code = erasure_code->decode(want_to_read, chunks, &decoded);
   if (code)
     return code;
@@ -1763,7 +1763,7 @@ int ErasureCodeBench::decode()
     want_to_encode.insert(i);
   }
 
-  map<int,bufferlist> encoded;
+  std::map<int,bufferlist> encoded;
   int code = erasure_code->encode(want_to_encode, in, &encoded);
   if (code)
     return code;
@@ -1785,12 +1785,12 @@ int ErasureCodeBench::decode()
       if (code)
 	return code;
     } else if (erased.size() > 0) {
-      map<int,bufferlist> decoded;
+      std::map<int,bufferlist> decoded;
       code = erasure_code->decode(want_to_read, encoded, &decoded);
       if (code)
 	return code;
     } else {
-      map<int,bufferlist> chunks = encoded;
+      std::map<int,bufferlist> chunks = encoded;
       for (int j = 0; j < erasures; j++) {
 	int erasure;
 	do {
@@ -1798,7 +1798,7 @@ int ErasureCodeBench::decode()
 	} while(chunks.count(erasure) == 0);
 	chunks.erase(erasure);
       }
-      map<int,bufferlist> decoded;
+      std::map<int,bufferlist> decoded;
       code = erasure_code->decode(want_to_read, chunks, &decoded);
       if (code)
 	return code;

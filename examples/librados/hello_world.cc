@@ -15,6 +15,8 @@
 #include <iostream>
 #include <string>
 
+int shard_size = 16777216*2;
+
 int main(int argc, const char **argv)
 {
   int ret = 0;
@@ -127,24 +129,28 @@ int main(int argc, const char **argv)
      * until the bufferlist goes out of scope and any requests using it
      * have been finished!
      */
-    librados::bufferlist bl;
-    bl.append(hello);
+    int buffers_created_count = 0;
+    for (int i = 0;i<120;i++) {
+      librados::bufferlist bl;
+      bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
 
-    /*
-     * now that we have the data to write, let's send it to an object.
-     * We'll use the synchronous interface for simplicity.
-     */
-    ret = io_ctx.write_full(object_name, bl);
-    if (ret < 0) {
-      std::cerr << "couldn't write object! error " << ret << std::endl;
-      ret = EXIT_FAILURE;
-      goto out;
-    } else {
-      std::cout << "we just wrote new object " << object_name
-	        << ", with contents\n" << hello << std::endl;
+      /*
+       * now that we have the data to write, let's send it to an object.
+       * We'll use the synchronous interface for simplicity.
+       */
+      ret = io_ctx.write_full(object_name + "." 
+			      + std::to_string(buffers_created_count), bl);
+      if (ret < 0) {
+	std::cerr << "couldn't write object! error " << ret << std::endl;
+	ret = EXIT_FAILURE;
+	goto out;
+      } else {
+	std::cout << "we just wrote new object " 
+		  << object_name + "." + std::to_string(buffers_created_count)
+		  << ", with contents\n" << hello << std::endl;
+      }
     }
   }
-
   /*
    * now let's read that object back! Just for fun, we'll do it using
    * async IO instead of synchronous. (This would be more useful if we
@@ -152,30 +158,61 @@ int main(int argc, const char **argv)
    * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
    */
   {
-    librados::bufferlist read_buf;
-    int read_len = 4194304; // this is way more than we need
-    // allocate the completion from librados
-    librados::AioCompletion *read_completion = librados::Rados::aio_create_completion();
-    // send off the request.
-    ret = io_ctx.aio_read(object_name, read_completion, &read_buf, read_len, 0);
-    if (ret < 0) {
-      std::cerr << "couldn't start read object! error " << ret << std::endl;
-      ret = EXIT_FAILURE;
-      goto out;
+    /*
+     * Prompt user so we wait to do the read.
+     */
+
+    std::string name;
+    std::cout << "Press enter when ready to proceed with read..." << std::endl;
+    std::getline(std::cin, name);
+    std::cout << "Proceeding to read object back..." << std::endl;
+
+    std::map<int,librados::bufferlist> read_buffers;
+    std::map<int,librados::AioCompletion *> completions;
+    for (int i = 0;i<120;i++) {
+      librados::bufferlist read_buf;
+      int read_len = shard_size;
+      // allocate the completion from librados
+      librados::AioCompletion *read_completion = librados::Rados::aio_create_completion();
+      completions.insert(std::pair<int,librados::AioCompletion *>(i,read_completion));
+      // send off the request.
+      ret = io_ctx.aio_read(object_name + "." + std::to_string(i), read_completion, &read_buf, read_len, 0);
+      if (ret < 0) {
+	std::cerr << "couldn't start read object! error " << ret << std::endl;
+	ret = EXIT_FAILURE;
+	goto out;
+      }
+      read_buffers.insert(std::pair<int,librados::bufferlist>(i,read_buf));
     }
+
     // wait for the request to complete, and check that it succeeded.
-    read_completion->wait_for_complete();
-    ret = read_completion->get_return_value();
-    if (ret < 0) {
-      std::cerr << "couldn't read object! error " << ret << std::endl;
-      ret = EXIT_FAILURE;
-      goto out;
-    } else {
-      std::cout << "we read our object " << object_name
-	  << ", and got back " << ret << " bytes with contents\n";
-      std::string read_string;
-      read_buf.copy(0, ret, read_string);
-      std::cout << read_string << std::endl;
+    librados::AioCompletion * read_completion;
+    librados::bufferlist read_buf;
+    for (int i = 0;i<120;i++) {
+      auto it = completions.find(i);
+      if (it != completions.end())
+	read_completion = it->second;
+      else
+	break;
+      read_completion->wait_for_complete();
+      ret = read_completion->get_return_value();
+      if (ret < 0) {
+	std::cerr << "couldn't read object! error " << ret << std::endl;
+	ret = EXIT_FAILURE;
+	goto out;
+      } else {
+	std::cout << "we read our object " << object_name + "." + std::to_string(i)
+		  << ", and got back " << ret << " bytes with contents\n";
+	std::string read_string;
+	auto it_buf = read_buffers.find(i);
+	if (it_buf != read_buffers.end()) {
+	  read_buf = it_buf->second;
+	  read_buf.copy(0, 20, read_string);
+	  std::cout << read_string << std::endl;
+	}
+	else
+	  break;
+      }
     }
   }
 

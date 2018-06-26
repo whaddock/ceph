@@ -8,7 +8,7 @@
 class Shard {
  private:
   librados::bufferlist bl;
-
+  librados::bufferlist *bl_ptr;
  public:
   bool read;
   int stripe;
@@ -40,6 +40,10 @@ class Shard {
 
   void set_bufferlist(librados::bufferlist _bl) {
     bl = _bl;
+  }
+
+  void set_bufferlist_ptr(librados::bufferlist *_bl_ptr) {
+    bl_ptr = _bl_ptr;
   }
 
   void dereference_bufferlist() {

@@ -1241,13 +1241,14 @@ void radosReadThread(ErasureCodeBench ecbench) {
       }
     }
 
+    // Build a stripe to read
     map<int,Shard> m_stripe;
     for (int i=0;i<stripe_size;i++) {
       index = stripe*stripe_size+i; // index == data.get_hash()
       std::stringstream object_name;
       object_name << obj_name << "." << index;
       Shard data(stripe,i,stripe_size,object_name.str());
-      assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+      //      assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
       m_stripe.insert( std::pair<int,Shard>(i,data));
 #ifdef TRACE
       output_lock.lock();
@@ -1271,93 +1272,94 @@ void radosReadThread(ErasureCodeBench ecbench) {
     std::cerr.flush();
     output_lock.unlock();
 #endif
-    // throttle... *** We need to do this differently because we must repair the stripe
-    // Completions are being handled by the readCompletionsThread.
-    completions_size = UINT_MAX; // Prime read.
-    while (completions_size > (uint32_t)concurrentios) {
-      completions_lock.lock(); // *** Get completions lock ***
-      completions_size = completions.size();
-      completions_lock.unlock(); // !!! completions lock released !!!
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "completions_size is " << completions_size << " in radosReadThread." << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
-      if (completions_size > (uint32_t)concurrentios)
-	std::this_thread::sleep_for(thread_sleep_duration);
-    }
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "completions_size < conncurrentios in radosReadThread." << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
 
-    /* We only want to readk K shards determined by the
-     * input parameters. Then we wait in the readCompletionsCollectionThread for
-     * the reads to complete before passing them on to the erasure code thread.
-     */
-    uint32_t count = 0;
-    // Iterate over all K + M shards in the stripe.
-    for (m_stripe_it=m_stripe.begin();
-	 m_stripe_it!=m_stripe.end();m_stripe_it++) {
-      shard = m_stripe_it->second;
-      bool is_erased = false;
-      stripe = shard.get_stripe();
-      offset = stripe * shard_size;
-      index = shard.get_shard();
-      string name = obj_name + "." + std::to_string(count);
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID  << "RTHREAD: Reading " << shard.get_object_name()
-			   << " from storage." << std::endl;
-      std::cerr THREAD_ID  << "shard: " << index << " stripe: " << stripe
-			   << " offset: " << offset << " ObjectID: "
-			   << name << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
-      for (int n : v_erased)
-	if (index == n)
-	  is_erased = true;
-      // We only need to read K shards. Prefer data shards, i.e. leading elements of map.
-      if (!is_erased && count < (uint32_t)K) {
-	librados::AioCompletion *c = rados.aio_create_completion();
-
-	librados::bufferlist bl;
-	ret = io_ctx.aio_read(name,c,&bl,shard_size,(uint64_t)offset);
-	shard.set_bufferlist(bl);
-
+    uint32_t count = 0; // counter for K shards to be read
+    while (processing_stripe) {
+      // throttle... *** We need to do this differently because we must repair the stripe
+      // Completions are being handled by the readCompletionsThread.
+      completions_size = UINT_MAX; // Prime read.
+      while (completions_size > (uint32_t)concurrentios) {
+	completions_lock.lock(); // *** Get completions lock ***
+	completions_size = completions.size();
+	completions_lock.unlock(); // !!! completions lock released !!!
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "Read called."
-			    << std::endl;
+	std::cerr THREAD_ID << "completions_size is " << completions_size << " in radosReadThread." << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	std::this_thread::sleep_for(read_sleep_duration);
-	if (ret < 0) {
+	if (completions_size > (uint32_t)concurrentios)
+	  std::this_thread::sleep_for(cc_thread_sleep_duration);
+      }
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "completions_size < conncurrentios in radosReadThread." << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+
+      /* We only want to readk K shards determined by the
+       * input parameters. Then we wait in the readCompletionsCollectionThread for
+       * the reads to complete before passing them on to the erasure code thread.
+       */
+      // Iterate over all K + M shards in the stripe.
+      m_stripe_it=m_stripe.find(count);
+      if (count <= (uint32_t)K &&  m_stripe_it!=m_stripe.end()) {
+	shard = m_stripe_it->second;
+	bool is_erased = false;
+	stripe = shard.get_stripe();
+	offset = stripe * shard_size;
+	index = shard.get_shard();
+	string name = obj_name + "." + std::to_string(count);
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID  << "RTHREAD: Reading " << shard.get_object_name()
+			     << " from storage." << std::endl;
+	std::cerr THREAD_ID  << "shard: " << index << " stripe: " << stripe
+			     << " offset: " << offset << " ObjectID: "
+			     << name << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
+	for (int n : v_erased)
+	  if (index == n)
+	    is_erased = true;
+	// We only need to read K shards. Prefer data shards, i.e. leading elements of map.
+	if (!is_erased) {
+	  librados::AioCompletion *c = rados.aio_create_completion();
+
+	  librados::bufferlist bl;
+	  ret = io_ctx.aio_read(name,c,&bl,shard_size,(uint64_t)offset);
+	  shard.set_bufferlist_ptr(&bl);
+
 #ifdef TRACE
 	  output_lock.lock();
-	  std::cerr THREAD_ID << "couldn't start read object! error at index "
-			      << shard.get_hash() << std::endl;
+	  std::cerr THREAD_ID << "Read called." << std::endl;
 	  std::cerr.flush();
 	  output_lock.unlock();
 #endif
-	  ret = EXIT_FAILURE;
-	  failed = true; 
-	  // We have had a failure, so do not execute any further, 
-	  // fall through.
+	  std::this_thread::sleep_for(read_sleep_duration);
+	  if (ret < 0) {
+#ifdef TRACE
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "couldn't start read object! error at index "
+				<< shard.get_hash() << std::endl;
+	    std::cerr.flush();
+	    output_lock.unlock();
+#endif
+	    ret = EXIT_FAILURE;
+	    failed = true; 
+	    // We have had a failure, so do not execute any further, 
+	    // fall through.
+	  }
+	  completions_lock.lock(); // *** Get completions lock ***
+	  completions.push_back(c);
+	  completions_lock.unlock(); // !!! completions lock released !!!
+	  count++; // Finished with a shard. Increment count for the next one.
 	}
-	completions_lock.lock(); // *** Get completions lock ***
-	completions.push_back(c);
-	completions_lock.unlock(); // !!! completions lock released !!!
-	count++; // Finished with a shard. Increment count for the next one.
       }
-      // DEBUG: Put in a little time to see how it affects the segfault
     } // End of iteration over shards in the stripe
-    // Keep the number of stripes less than MAX_STRIPE_QUEUE_SIZE
+      // Keep the number of stripes less than MAX_STRIPE_QUEUE_SIZE
     stripes_read_size = INT_MAX;
     while (stripes_read_size > max_stripes_read_size) {
       stripes_read_lock.lock(); // *** Get stripes read 
@@ -1391,8 +1393,6 @@ void radosReadThread(ErasureCodeBench ecbench) {
 #endif
   }   // End Read loop
 
-  rados.shutdown();
-  ret = failed ? ret:EXIT_SUCCESS;
 #ifdef TRACE
   output_lock.lock();
   std::cerr THREAD_ID << "Read thread exiting now." << std::endl;
@@ -1880,9 +1880,6 @@ int main(int argc, const char** argv) {
     // the iteration loop begins here
     utime_t begin_time_final = ceph_clock_now(g_ceph_context);
 
-    FINISH_TIMER; // Compute total time since START_TIMER
-    REPORT_TIMING;
-
     START_TIMER; // Code for the begin_time
 
     /* Test for work to finish. When encoding/writing, encoding will finish first, then
@@ -1898,6 +1895,18 @@ int main(int argc, const char** argv) {
      */
     //    const std::chrono::milliseconds debug_sleep_duration(1000);
     //    std::this_thread::sleep_for(debug_sleep_duration);
+
+
+    bool stripes_empty = false;
+    while (!stripes_empty) {
+      stripes_lock.lock(); // *** stripes_lock acquired ***
+      if (stripes.empty())
+	stripes_empty = true;
+      stripes_lock.unlock(); // !!! stripes_lock released !!!
+      if (!stripes_empty)
+	std::this_thread::sleep_for(shutdown_sleep_duration);
+    }
+
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Shutdown: Starting test for done." << std::endl;

@@ -15,11 +15,12 @@
 #include <iostream>
 #include <string>
 
-int shard_size = 16777216*2;
 
 int main(int argc, const char **argv)
 {
   int ret = 0;
+  int shard_size = 16777216*2;
+  int iterations = 10;
 
   // we will use all of these below
   const char *pool_name = "hello_world_pool";
@@ -113,6 +114,7 @@ int main(int argc, const char **argv)
       goto out;
     } else {
       std::cout << "we just created an ioctx for our pool" << std::endl;
+      std::cout.flush();
     }
   }
 
@@ -129,10 +131,10 @@ int main(int argc, const char **argv)
      * until the bufferlist goes out of scope and any requests using it
      * have been finished!
      */
-    int buffers_created_count = 0;
-    for (int i = 0;i<120;i++) {
+    for ( int buffers_created_count = 0;
+	  buffers_created_count<iterations;buffers_created_count++) {
       librados::bufferlist bl;
-      bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
+      bl.append(std::string(shard_size,(char)buffers_created_count%26+97)); // start with 'a'
 
       /*
        * now that we have the data to write, let's send it to an object.
@@ -142,12 +144,14 @@ int main(int argc, const char **argv)
 			      + std::to_string(buffers_created_count), bl);
       if (ret < 0) {
 	std::cerr << "couldn't write object! error " << ret << std::endl;
+	std::cerr.flush();
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
 	std::cout << "we just wrote new object " 
 		  << object_name + "." + std::to_string(buffers_created_count)
 		  << ", with contents\n" << hello << std::endl;
+	std::cout.flush();
       }
     }
   }
@@ -169,7 +173,7 @@ int main(int argc, const char **argv)
 
     std::map<int,librados::bufferlist> read_buffers;
     std::map<int,librados::AioCompletion *> completions;
-    for (int i = 0;i<120;i++) {
+    for (int i = 0;i<iterations;i++) {
       librados::bufferlist read_buf;
       int read_len = shard_size;
       // allocate the completion from librados
@@ -181,6 +185,10 @@ int main(int argc, const char **argv)
 	std::cerr << "couldn't start read object! error " << ret << std::endl;
 	ret = EXIT_FAILURE;
 	goto out;
+      } else {
+	std::cout << "we did aio read on object " << object_name + "." + std::to_string(i)
+		  << std::endl;
+	std::cout.flush();
       }
       read_buffers.insert(std::pair<int,librados::bufferlist>(i,read_buf));
     }
@@ -188,7 +196,7 @@ int main(int argc, const char **argv)
     // wait for the request to complete, and check that it succeeded.
     librados::AioCompletion * read_completion;
     librados::bufferlist read_buf;
-    for (int i = 0;i<120;i++) {
+    for (int i = 0;i<iterations;i++) {
       auto it = completions.find(i);
       if (it != completions.end())
 	read_completion = it->second;
@@ -198,20 +206,23 @@ int main(int argc, const char **argv)
       ret = read_completion->get_return_value();
       if (ret < 0) {
 	std::cerr << "couldn't read object! error " << ret << std::endl;
+	std::cerr.flush();
 	ret = EXIT_FAILURE;
 	goto out;
       } else {
 	std::cout << "we read our object " << object_name + "." + std::to_string(i)
-		  << ", and got back " << ret << " bytes with contents\n";
+		  << ", and got back " << ret << " bytes with contents"  << std::endl;
+	std::cout.flush();
+	/*
 	std::string read_string;
 	auto it_buf = read_buffers.find(i);
 	if (it_buf != read_buffers.end()) {
 	  read_buf = it_buf->second;
 	  read_buf.copy(0, 20, read_string);
 	  std::cout << read_string << std::endl;
+	std::cout.flush();
 	}
-	else
-	  break;
+	*/
       }
     }
   }

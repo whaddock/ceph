@@ -14,19 +14,21 @@
 #include <rados/librados.hpp>
 #include <iostream>
 #include <string>
-
+#include <thread>
+#include <chrono>
 
 int main(int argc, const char **argv)
 {
   int ret = 0;
   int shard_size = 16777216*2;
-  int iterations = 10;
+  int iterations = 3;
 
   // we will use all of these below
   const char *pool_name = "hello_world_pool";
   std::string hello("hello world!");
   std::string object_name("hello_object");
   librados::IoCtx io_ctx;
+  const std::chrono::milliseconds read_sleep_duration(100);
 
   // first, we create a Rados object and initialize it
   librados::Rados rados;
@@ -191,11 +193,12 @@ int main(int argc, const char **argv)
 	std::cout.flush();
       }
       read_buffers.insert(std::pair<int,librados::bufferlist>(i,read_buf));
+      std::this_thread::sleep_for(read_sleep_duration);
     }
 
     // wait for the request to complete, and check that it succeeded.
     librados::AioCompletion * read_completion;
-    librados::bufferlist read_buf;
+    //    librados::bufferlist read_buf;
     for (int i = 0;i<iterations;i++) {
       auto it = completions.find(i);
       if (it != completions.end())
@@ -224,6 +227,7 @@ int main(int argc, const char **argv)
 	}
 	*/
       }
+      std::this_thread::sleep_for(read_sleep_duration);
     }
   }
 
@@ -329,6 +333,8 @@ int main(int argc, const char **argv)
 
   ret = EXIT_SUCCESS;
   out:
+  std::cerr << "Exit routine. Results: " << ret << std::endl;
+  std::cerr.flush();
   /*
    * And now we're done, so let's remove our pool and then
    * shut down the connection gracefully.

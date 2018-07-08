@@ -43,7 +43,21 @@ am__append_29 = -lbz2
 #am__append_30 = -llz4
 LIBERASURE_CODE = $(ceph_libs)/liberasure_code.a
 
-all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test rados_threaded_ec_write_test machine_threads 
+all: aio_write_test_queue aio_read_test_queue rados_threaded_read_test rados_threaded_write_test \
+ rados_threaded_ec_write_test machine_threads ceph_gibraltar_bench ceph_gibraltar_bench_threaded \
+ceph_gibraltar_bench_aio_read
+
+ceph_gibraltar_bench_aio_read: ceph_gibraltar_bench_aio_read.cc
+	g++ -g -c ceph_gibraltar_bench_aio_read.cc -o ceph_gibraltar_bench_aio_read.o $(CXXFLAGS)
+	g++ -g ceph_gibraltar_bench_aio_read.o  -o ceph_gibraltar_bench_aio_read $(LDFLAGS)
+
+ceph_gibraltar_bench: ceph_gibraltar_bench.cc
+	g++ -g -c ceph_gibraltar_bench.cc -o ceph_gibraltar_bench.o $(CXXFLAGS)
+	g++ -g ceph_gibraltar_bench.o  -o ceph_gibraltar_bench $(LDFLAGS)
+
+ceph_gibraltar_bench_threaded: ceph_gibraltar_bench_threaded.cc
+	g++ -g -c ceph_gibraltar_bench_threaded.cc -o ceph_gibraltar_bench_threaded.o $(CXXFLAGS)
+	g++ -g ceph_gibraltar_bench_threaded.o  -o ceph_gibraltar_bench_threaded $(LDFLAGS)
 
 librados_hello_world: hello_world.cc
 	g++ -g -c hello_world.cc -o hello_world.o $(CXXFLAGS)

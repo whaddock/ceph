@@ -8,14 +8,13 @@
 class Shard {
  private:
   librados::bufferlist bl;
-
- public:
   bool read;
   int stripe;
   int shard;
   int stripe_size;
   std::string object_name;
 
+ public:
   Shard(int _stripe, int _shard, int _stripe_size,
 	 std::string _object_name) 
     : stripe (_stripe), shard (_shard), stripe_size (_stripe_size),
@@ -47,11 +46,15 @@ class Shard {
   } // drop the reference to the bufferlist.
 
   void clear_read() {
-    read = true;
+    read = false;
   }
 
   bool is_read() {
     return read;
+  }
+
+  Shard * get_pointer() {
+    return this;
   }
 
   int get_stripe() {
@@ -66,6 +69,7 @@ class Shard {
   std::string get_object_name() {
     return object_name;
   }
+ private:
   // This static class member returns a large integer when called
   // with a bogus reference. How do we fix this?
   static int compute_hash(int _i,int _j, int _stripe_size) {

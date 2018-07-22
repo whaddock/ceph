@@ -51,12 +51,14 @@
 #include <cassert>
 #include <chrono>
 
-#define TRACE
+/* #define TRACE 
+   #define VERBOSITY_1 */
 #define RADOS_THREADS 1
 
 #ifndef EC_THREADS
 #define EC_THREADS 10
 #endif
+#define EXTRA_BUFFERS 4
 #define MAX_DECODE_QUEUE_SIZE 2
 #define COMPLETION_WAIT_COUNT 500
 #define STRIPE_QUEUE_FACTOR 2
@@ -134,7 +136,6 @@ std::mutex completions_lock;
 std::mutex shards_lock;
 std::mutex pending_buffers_queue_lock;
 std::mutex write_buffers_waiting_lock;
-std::mutex objs_lock;
 std::mutex pending_ops_lock;
 std::mutex cout_lock;
 
@@ -175,7 +176,7 @@ void insert_pending_op(int index, CompletionOp *op) {
   return;
 }
 
-int get_stripes_size() { 
+int get_stripes_queue_size() { 
   std::lock_guard<std::mutex> guard(stripes_lock);
   return stripes.size();
 }
@@ -197,7 +198,7 @@ bool is_stripes_queue_empty() {
   return stripes.empty();
 }
 
-int get_shards_size() {
+int get_shards_map_size() {
   std::lock_guard<std::mutex> guard(shards_lock);
   return shards.size();
 }
@@ -206,6 +207,40 @@ void insert_shard(int index, Shard shard) {
   std::lock_guard<std::mutex> guard(shards_lock);
   shards.insert(std::pair<int,Shard>(index,shard));
   return;
+}
+
+/* Getting a shard is a two step call and the postRead thread
+ * is the only consumer. Because the read callback mechanism
+ * is inserting shards into the map after they have been read,
+ * we need to make this a mutex. It is possible for one operation
+ * to interfere with the other and corrupt the map.
+ *
+ * First, the call to is_shard_available is made. Once this returns
+ * true, then the second call to get_shard_and_erase is made. The second
+ * call will get the shard that has already been determined to be
+ * available and erase it from the map.
+ *
+ * We have implemented this queue as a map because we need to organize
+ * the shards into stripes for further processing. The read callback
+ * mechanism knows which slot the shard goes into which makes this a
+ * convenient way to process shards that have been read as stripes
+ * for the erasure code processing.
+ */
+bool is_shard_available(int index) {
+  std::lock_guard<std::mutex> guard(shards_lock);
+  std::map<int, Shard>::iterator it = shards.find(index);
+  bool status = true;
+  if (it == shards.end()) 
+    status = false;
+  return status;
+}
+
+Shard get_shard_and_erase(int index) {
+  std::lock_guard<std::mutex> guard(shards_lock);
+  std::map<int, Shard>::iterator it = shards.find(index);
+  Shard shard = it->second;
+  shards.erase(it);
+  return shard;
 }
 
 bool is_shards_map_empty() {
@@ -218,10 +253,15 @@ bool is_stripes_decode_queue_empty() {
   return stripes_decode_queue.empty();
 }
 
-std::map<int,Shard> get_stripe_decode() {
+std::map<int,Shard> get_stripe_decode(bool status) {
+  std::map<int,Shard> stripe;
   std::lock_guard<std::mutex> guard(stripes_decode_queue_lock);
-  std::map<int,Shard> stripe = stripes_decode_queue.front();
-  stripes_decode_queue.pop();
+  if (stripes_decode_queue.empty())
+    status = false;
+  else {
+    stripe = stripes_decode_queue.front();
+    stripes_decode_queue.pop();
+  }
   return stripe;
 }
 
@@ -420,10 +460,6 @@ void bootstrapThread()
 #endif
 
   int buf_len = 1;
-  bufferptr p = buffer::create(buf_len);
-  bufferlist bl;
-  memset(p.c_str(), 0, buf_len);
-  bl.push_back(p);
 
 #ifdef TRACE
     output_lock.lock();
@@ -432,11 +468,8 @@ void bootstrapThread()
     std::cerr.flush();
     output_lock.unlock();
 #endif
-  list<librados::AioCompletion *> _completions;
   for (int index = 0; index < stripe_size; index++) {
-    objs_lock.lock(); // *** Get objs lock.
     obj_info info = objs[index];
-    objs_lock.unlock(); // !!! Release objs lock.
 #ifdef TRACE
     output_lock.lock();
     std::cerr THREAD_ID << "Creating object: " << info.name
@@ -444,32 +477,23 @@ void bootstrapThread()
     std::cerr.flush();
     output_lock.unlock();
 #endif
+    bufferptr p = buffer::create(buf_len);
+    bufferlist bl;
+    memset(p.c_str(), 0, buf_len);
+    bl.push_back(p);
 
-    librados::AioCompletion *c = rados.aio_create_completion(NULL, NULL, NULL);
-    _completions.push_back(c);
+    CompletionOp *op = new CompletionOp(info.name);
+    op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
+    op->id = index;
+    op->bl = bl;
+
     // generate object
-    ret = io_ctx.aio_write(info.name, c, bl, buf_len, info.len - buf_len);
+    ret = io_ctx.aio_write(info.name, op->completion, op->bl, buf_len, info.len - buf_len);
     if (ret < 0) {
       cerr << "couldn't write obj: " << info.name << " ret=" << ret << std::endl;
     }
   }
-  // Cleanup bootstrap
-  while (!_completions.empty()) {
-    librados::AioCompletion *c = _completions.front();
-#ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Waiting on object to finish..." << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
-#endif
-    c->wait_for_complete();
-    ret = c->get_return_value();
-    c->release();
-    _completions.pop_front();
-    if (ret < 0) {
-      cerr << "aio_write failed" << std::endl;
-    }
-  }
+
 #ifdef TRACE
   output_lock.lock();
   std::cerr THREAD_ID << "Finished bootstrapThread(), exiting." << std::endl;
@@ -481,7 +505,6 @@ void bootstrapThread()
 void radosWriteThread() {
   bool started = false;
   int ret;
-  int pending_ops_size = INT_MAX;
   uint32_t shard_counter = 0;
   uint32_t stripe = 0;
   uint32_t index = 0;
@@ -512,9 +535,7 @@ void radosWriteThread() {
       stripe = shard_counter / stripe_size;
       offset = stripe * shard_size;
       index = shard_counter % stripe_size;
-      objs_lock.lock(); // *** Get objs lock.
       name = objs[index].name;
-      objs_lock.unlock(); // !!! Release objs lock.
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID  << "pbit: pending_buffers size (" << get_pending_buffers_queue_size()
@@ -583,11 +604,10 @@ void radosWriteThread() {
        * a bijection, we are assured of dereferencing the corresponding
        * buffer once the write has completed.
        */
-      pending_ops_size = get_pending_ops_size();
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "pending_ops_size "
-			    << pending_ops_size << " > " << concurrentios
+			    << get_pending_ops_size() << " > " << concurrentios
 			    << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
@@ -659,6 +679,9 @@ void radosReadThread(ErasureCodeBench ecbench) {
 	break;
       }
 
+#ifdef VERBOSITY_1
+      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
+#endif
       // On the read benchmark, we only read K shards from Ceph.
       for (int i=0;i<K;i++) {
 	obj_info info = objs[i];
@@ -706,9 +729,36 @@ void radosReadThread(ErasureCodeBench ecbench) {
 	}
 	insert_pending_op(count,op);
 	count++; // Finished with a shard. Increment count for the next one.
+
+	/* throttle...
+	 * This block causes the read thread to wait on
+	 * the read ops so we don't over demand
+	 * the IO system.
+	 */
+	while (get_pending_ops_size() > concurrentios) {
+	  std::this_thread::sleep_for(read_sleep_duration);
+	}
+
+      } // Finished a stripe.
+      /* throttle...
+       * This block causes the read thread to wait on
+       * the erasure decoding so we don't over demand
+       * memory.
+       */
+      while (get_shards_map_size() > MAX_DECODE_QUEUE_SIZE * (ec_threads + EXTRA_BUFFERS) * K) {
+	std::this_thread::sleep_for(shutdown_sleep_duration);
       }
-    }
-  } 
+
+    } // While loop over stripes queue
+  }  // While loop waiting for reading to be done.
+#ifdef TRACE
+  output_lock.lock();
+  std::cerr THREAD_ID << "Read thread exiting now." << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+#endif
+
+  return; // Thread terminates
 }
 
 void postReadThread() {
@@ -742,37 +792,45 @@ void postReadThread() {
      * the first stripe has an index of 0..K-1, the second stripe has indices
      * of K..2K-1, etc.
      */
-    while (!is_shards_map_empty() && !aio_done) {
-      map<int, Shard> m_stripe;
-      int shard = 0;
-      for ( int index = stripe * K;index < (1 + stripe) * K; index++, shard++) {
-	std::map<int, Shard>::iterator it = shards.find(index);
-	while (it == shards.end()) {
-	  it = shards.find(index);
-	  std::this_thread::sleep_for(read_sleep_duration);
-	}
-	m_stripe.insert(std::pair<int, Shard>(shard,it->second));
-      }
 
-      // Limit the number of stripes waiting for decode to a reasonable number per ec thread
-      while (get_stripes_decode_queue_size() > MAX_DECODE_QUEUE_SIZE * ec_threads) {
-	std::this_thread::sleep_for(shutdown_sleep_duration);
+    /* We have to guard everything with aio_done in case it occurs after
+     * the routine has started. There is a good possibility of this 
+     * condition occuring when we are running multiple erasure coding
+     * threads. The logic will not set aio_done to true until the
+     * shards map is empty and all of the IO has completed. If we
+     * are building the last stripe, aio_done will remain false
+     * until some time after the last share is taken.
+     */
+    map<int, Shard> m_stripe;
+    int shard = 0;
+    for ( int index = stripe * K;index < (1 + stripe) * K; index++, shard++) {
+      while (!aio_done && !is_shard_available(index)) {
+	std::this_thread::sleep_for(read_sleep_duration);
       }
+      if (aio_done)
+	break;
+      Shard _shard = get_shard_and_erase(index);
+      m_stripe.insert(std::pair<int, Shard>(shard,_shard));
+    }
 
+    // Limit the number of stripes waiting for decode to a reasonable number per ec thread
+    while (!aio_done && get_stripes_decode_queue_size() > MAX_DECODE_QUEUE_SIZE * (ec_threads + EXTRA_BUFFERS)) {
+      std::this_thread::sleep_for(read_sleep_duration);
+    }
+
+    if (!aio_done) {
       insert_stripe_decode(m_stripe);
       stripe++; // Increment to next stripe.
-#ifdef TRACE
+#ifdef VERBOSITY_1
       output_lock.lock();
+      std::cerr THREAD_ID << "shards_map_size is " << get_shards_map_size() << std::endl;
       std::cerr THREAD_ID << "stripes_decode_size is " << get_stripes_decode_queue_size() 
 			  << " in postReadThread, done reading a stripe." 
 			  << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
-
-    }   // End stripe building loop
-    // Delay a little befor checking again.
-    std::this_thread::sleep_for(thread_sleep_duration);
+    }
   } // End of aio loop
 #ifdef TRACE
   output_lock.lock();
@@ -894,9 +952,11 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 
 void erasureDecodeThread(ErasureCodeBench ecbench) {
   bool started = false;
+  bool got_stripe = false;
   Shard shard;
   map<int,Shard> stripe;
   map<int,Shard>::iterator stripe_it;
+  map<int,librados::bufferlist>::iterator encoded_it;
   map<int,librados::bufferlist> encoded;
 
   if(!started) {
@@ -909,52 +969,64 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 #endif
   }
   while (!ec_done) {
+    got_stripe = true; // Test for getting a stripe from the decode queue.
     if (!is_stripes_decode_queue_empty()) {
-      stripe = get_stripe_decode();
+      stripe = get_stripe_decode(got_stripe);
+      if (got_stripe) {
 
-    // We have a stripe to repair. There are K shards in stripe.
-    for (stripe_it=stripe.begin();
-	 stripe_it!=stripe.end();stripe_it++) {
-      encoded.insert(pair<int,librados::bufferlist>(stripe_it->second.get_shard(),stripe_it->second.get_bufferlist()));
-    }
+	// We have a stripe to repair. There are K shards in stripe.
+	for (stripe_it=stripe.begin();
+	     stripe_it!=stripe.end();stripe_it++) {
+	  encoded.insert(pair<int,librados::bufferlist>(stripe_it->second.get_shard(),stripe_it->second.get_bufferlist()));
+	}
 
-    // Add the M parity buffers.
-    for (int m = 0; m < M; m++) {
-      librados::bufferlist bl = librados::bufferlist();
-      bl.append(std::string(shard_size,(char)20)); // fill with space
-      encoded.insert(pair<int,librados::bufferlist>(K+m,bl));
-    }
+	// Add the M parity buffers.
+	for (int m = 0; m < M; m++) {
+	  librados::bufferlist bl = librados::bufferlist();
+	  bl.append(std::string(shard_size,(char)20)); // fill with space
+	  encoded.insert(pair<int,librados::bufferlist>(K+m,bl));
+	}
 
-    ret = ecbench.encode(&encoded);
-    // For now, we are just recreating the M parity shards, worst case. 
-    if (ret < 0) {
-      output_lock.lock();
-      std::cerr THREAD_ID << "Error in erasure code call to ecbench. " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-    } 
+	ret = ecbench.encode(&encoded);
+	// For now, we are just recreating the M parity shards, worst case. 
+	if (ret < 0) {
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "Error in erasure code call to ecbench. " << ret << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+	} 
 
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Stripe " <<  stripe.begin()->second.get_stripe() 
-			<< " decoded in erasureDecodeThread()" << std::endl;
-    std::cerr THREAD_ID << "Decoding done, buffers discarded, in erasureDeodeThread()."
-			<< std::endl;
-    std::cerr THREAD_ID << "stripes_decode_size: " << get_stripes_decode_queue_size() << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+	output_lock.lock();
+	std::cerr THREAD_ID << "Stripe " <<  stripe.begin()->second.get_stripe() 
+			    << " decoded in erasureDecodeThread()" << std::endl;
+	std::cerr THREAD_ID << "Decoding done, buffers discarded, in erasureDecodeThread()."
+			    << std::endl;
+	std::cerr THREAD_ID << "stripes_decode_size: " << get_stripes_decode_queue_size() << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 #endif
-    encoded.clear();
-    /* Need to release the stripe memory. We are just measuring the time to repair
-     * the stripe. Now we can release the resources*/
-    stripe.clear();
-    encoded.clear();
-  }
-  else 
+	encoded.clear();
+	/* Need to release the stripe memory. We are just measuring the time to repair
+	 * the stripe. Now we can release the resources*/
+	for (stripe_it=stripe.begin();
+	     stripe_it!=stripe.end();stripe_it++) {
+	  stripe_it->second.dereference_bufferlist();
+	  //Shard * p_shard = stripe_it->second.get_pointer();
+	  stripe.erase(stripe_it);
+	  //p_shard->~Shard();
+	}
+    
+	for (encoded_it=encoded.begin();
+	     encoded_it!=encoded.end();encoded_it++) 
+	  encoded.erase(encoded_it);
+      }
+    }
+    else 
       std::this_thread::sleep_for(shutdown_sleep_duration);
 
   }
-#ifdef TRACE
+#ifdef VERBOSITY_1
   output_lock.lock();
   std::cerr THREAD_ID << "erasureDecodeThread exiting now." << std::endl;
   std::cerr.flush();
@@ -1503,7 +1575,7 @@ int main(int argc, const char** argv) {
 
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown:Done with writing." << std::endl;
+      std::cerr THREAD_ID << "Shutdown: Done with writing." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1518,7 +1590,7 @@ int main(int argc, const char** argv) {
       }
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown:Done with completions." << std::endl;
+      std::cerr THREAD_ID << "Shutdown: Done with completions." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1532,7 +1604,7 @@ int main(int argc, const char** argv) {
 	rit->join(); // wait for the rados threads to finish.
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown:Done with aio." << std::endl;
+      std::cerr THREAD_ID << "Shutdown: Done with aio." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1552,7 +1624,7 @@ int main(int argc, const char** argv) {
 	else {
 #ifdef TRACE
 	  output_lock.lock();
-	  std::cerr THREAD_ID << "Shutdown: stripes() is " << stripes_that_remain <<
+	  std::cerr THREAD_ID << "Shutdown: stripes() is " << get_stripes_queue_size() <<
 	    " in reading routine." << std::endl;
 	  std::cerr.flush();
 	  output_lock.unlock();
@@ -1562,7 +1634,7 @@ int main(int argc, const char** argv) {
       }
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown:Done with reading." << std::endl;
+      std::cerr THREAD_ID << "Shutdown: Done with reading." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1572,13 +1644,27 @@ int main(int argc, const char** argv) {
       for (rit=rados_threads.begin();rit!=rados_threads.end();rit++)
 	rit->join(); // wait for the rados threads to finish.
 
-      while (get_pending_ops_size() > 0) {
+      while (get_pending_ops_size() > 0) 
+	std::this_thread::sleep_for(shutdown_sleep_duration);
+
+#ifdef VERBOSITY_1
+      std::cout << "Shutdown: Pending Ops Size is: " << get_pending_ops_size() << std::endl;
+#endif
+
+      while (!is_shards_map_empty()) {
+#ifdef VERBOSITY_1
+	std::cout << "Shutdown: Shards Map Size is: " << get_shards_map_size() << std::endl;
+#endif
 	std::this_thread::sleep_for(shutdown_sleep_duration);
       }
+#ifdef VERBOSITY_1
+      std::cout << "Shutdown: Shards Map is empty. Setting aio_done." << std::endl;
+#endif
+
       aio_done = true; // this should stop the post read thread
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Shutdown:Done with aio." << std::endl;
+      std::cerr THREAD_ID << "Shutdown: Done with aio." << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1588,8 +1674,12 @@ int main(int argc, const char** argv) {
       while (!ec_done) {
 	if (is_stripes_decode_queue_empty())
 	  ec_done = true;
-	else
+	else {
+#ifdef VERBOSITY_1
+	  std::cout << "Shutdown: Stripes Decode Queue Size is: " << get_stripes_decode_queue_size() << std::endl;
+#endif
 	  std::this_thread::sleep_for(shutdown_sleep_duration);
+	}
       }
       std::vector<std::thread>::iterator ecit;
       for (ecit=v_ec_threads.begin();ecit!=v_ec_threads.end();ecit++)

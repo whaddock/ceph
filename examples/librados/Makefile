@@ -97,17 +97,26 @@ rados_threaded_write_test: rados_threaded_write_test.cc
 
 rados_threaded_ec_write_test: rados_threaded_ec_write_test.cc
 	g++ -g -c rados_threaded_ec_write_test.cc -o rados_threaded_ec_write_test.o $(CXXFLAGS)
-	g++ -g rados_threaded_ec_write_test.o  -o rados_threaded_ec_write_test \
- $(LDFLAGS) $(ceph_erasure_code_benchmark_LDADD)
-
+	g++ -g rados_threaded_ec_write_test.o  -o rados_threaded_ec_write_test $(LDFLAGS) $(ceph_erasure_code_benchmark_LDADD)
 
 rados_threaded_read_test: rados_threaded_read_test.cc
 	g++ -g -c rados_threaded_read_test.cc -o rados_threaded_read_test.o $(CXXFLAGS)
 	g++ -g rados_threaded_read_test.o  -o rados_threaded_read_test $(LDFLAGS)
 
+bogus: $@.cc
+#	echo "$@"
+#	echo "$^"
+#	echo "$<"
+#	echo "$(CXXFLAGS)
+#	echo "$(LDFLAGS)
+
 machine_threads: machine_threads.cc
 	g++ -g -c machine_threads.cc -o machine_threads.o $(CXXFLAGS)
 	g++ -g machine_threads.o  -o machine_threads $(LDFLAGS)
+
+ceph_native_write_benchmark: ceph_native_write_benchmark.cc
+	g++ -g -c ceph_native_write_benchmark.cc  -o $ceph_native_write_benchmark.o $(CXXFLAGS)
+	g++ -g $ceph_native_write_benchmark.o  -o ceph_native_write_benchmark $(LDFLAGS)
 
 clean:
 	rm hello_world.o librados_hello_world

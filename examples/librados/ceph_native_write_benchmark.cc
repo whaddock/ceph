@@ -41,46 +41,32 @@
 #include <climits>
 
 #define RADOS_THREADS 1
+#define READ_SLEEP_DURATION 2 // in milliseconds
 
 // Globals
 int in_size, rados_mode, concurrentios;
 int queue_size, max_iterations;
 std::string obj_name, pool_name;
 boost::intrusive_ptr<CephContext> cct;
+std::queue<int> stripes;
+bool writing_done = false;
+bool reading_done = false;
+librados::Rados rados;
+librados::IoCtx io_ctx;
+const std::chrono::milliseconds read_sleep_duration(READ_SLEEP_DURATION);
 
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
 std::mutex stripes_lock;
-std::mutex stripes_read_lock;
-std::mutex stripes_decode_queue_lock;
 std::mutex completions_lock;
-std::mutex shards_lock;
-std::mutex pending_buffers_queue_lock;
-std::mutex write_buffers_waiting_lock;
 std::mutex pending_ops_lock;
 std::mutex cout_lock;
-
-// Object information. We stripe over these objects.
-struct obj_info {
-  std::string name;
-  size_t len;
-};
-std::map<int, obj_info> objs;
-
-struct Shard {
-  std::string name;
-};
-
-std::queue<int> stripes;
-std::queue<std::map<int,Shard>> stripes_decode_queue;
-std::queue<Shard> pending_buffers_queue;
 
 struct CompletionOp {
   int id;
   std::string name;
   librados::AioCompletion *completion;
   librados::bufferlist bl;
-  Shard shard;
 
   explicit CompletionOp(std::string _name) : id(0), name(_name), completion(NULL) {}
 };
@@ -126,111 +112,6 @@ bool is_stripes_queue_empty() {
   std::lock_guard<std::mutex> guard(stripes_lock);
   return stripes.empty();
 }
-/*
-int get_shards_map_size() {
-  std::lock_guard<std::mutex> guard(shards_lock);
-  return shards.size();
-}
-
-void insert_shard(int index, Shard shard) {
-  std::lock_guard<std::mutex> guard(shards_lock);
-  shards.insert(std::pair<int,Shard>(index,shard));
-  return;
-}
-*/
-/* Getting a shard is a two step call and the postRead thread
- * is the only consumer. Because the read callback mechanism
- * is inserting shards into the map after they have been read,
- * we need to make this a mutex. It is possible for one operation
- * to interfere with the other and corrupt the map.
- *
- * First, the call to is_shard_available is made. Once this returns
- * true, then the second call to get_shard_and_erase is made. The second
- * call will get the shard that has already been determined to be
- * available and erase it from the map.
- *
- * We have implemented this queue as a map because we need to organize
- * the shards into stripes for further processing. The read callback
- * mechanism knows which slot the shard goes into which makes this a
- * convenient way to process shards that have been read as stripes
- * for the erasure code processing.
- */
-/*
-bool is_shard_available(int index) {
-  std::lock_guard<std::mutex> guard(shards_lock);
-  std::map<int, Shard>::iterator it = shards.find(index);
-  bool status = true;
-  if (it == shards.end()) 
-    status = false;
-  return status;
-}
-
-Shard get_shard_and_erase(int index) {
-  std::lock_guard<std::mutex> guard(shards_lock);
-  std::map<int, Shard>::iterator it = shards.find(index);
-  Shard shard = it->second;
-  shards.erase(it);
-  return shard;
-}
-
-bool is_shards_map_empty() {
-  std::lock_guard<std::mutex> guard(shards_lock);
-  return shards.empty();
-}
-*/
-
-bool is_stripes_decode_queue_empty() {
-  std::lock_guard<std::mutex> guard(stripes_decode_queue_lock);
-  return stripes_decode_queue.empty();
-}
-
-std::map<int,Shard> get_stripe_decode(bool status) {
-  std::map<int,Shard> stripe;
-  std::lock_guard<std::mutex> guard(stripes_decode_queue_lock);
-  if (stripes_decode_queue.empty())
-    status = false;
-  else {
-    stripe = stripes_decode_queue.front();
-    stripes_decode_queue.pop();
-  }
-  return stripe;
-}
-
-void insert_stripe_decode(std::map<int,Shard> stripe) {
-  std::lock_guard<std::mutex> guard(stripes_decode_queue_lock);
-  stripes_decode_queue.push(stripe);
-  return;
-}
-
-
-int get_stripes_decode_queue_size() {
-  std::lock_guard<std::mutex> guard(stripes_decode_queue_lock);
-  return stripes_decode_queue.size();
-}
-
-int get_pending_buffers_queue_size() {
-  std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
-  return pending_buffers_queue.size();
-}
-
-bool is_pending_buffers_queue_empty() {
-  std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
-  return pending_buffers_queue.empty();
-}
-
-void pending_buffers_queue_push(Shard shard) {
-  std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
-  pending_buffers_queue.push(shard);
-  return;
-}
-
-Shard pending_buffers_queue_pop() {
-  std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
-  Shard shard = pending_buffers_queue.front();
-  pending_buffers_queue.pop();
-  return shard;
-}
-
 void io_cb(librados::completion_t c, CompletionOp *op) {
   std::lock_guard<std::mutex> guard(pending_ops_lock);
 
@@ -258,8 +139,6 @@ void read_cb(librados::completion_t c, CompletionOp *op) {
 
   op->completion->release();
 
-  // For reads we need to keep the shard object for erasure coding
-  //  insert_shard(op->id,op->shard);
   delete op;
   //  std::cout << "-";
 }
@@ -268,6 +147,197 @@ static void _read_completion_cb(librados::completion_t c, void *param)
 {
   CompletionOp *op = (CompletionOp *)param;
   read_cb(c, op);
+}
+
+void radosWriteThread() {
+  bool started = false;
+  int ret;
+  int stripe = 0;
+  string name;
+
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting radosWriteThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+  }
+
+  // Write loop 
+  while (!writing_done) {
+    // wait for the request to complete, and check that it succeeded.
+
+    while (!is_stripes_queue_empty()) {
+      if ( (stripe = get_stripe()) < 0) {
+	/* When the stripes queue is empty, we have submitted all of the
+	 * work to be done. If by chance another thread grabbed the last
+	 * work item from the stripes queue, then this test will exit now.
+	 */
+	break;
+      }
+
+      name = obj_name + std::to_string(stripe);
+#ifdef VERBOSITY_1
+      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
+#endif
+      CompletionOp *op = new CompletionOp(name);
+      op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
+      op->id = stripe;
+      op->bl = librados::bufferlist();
+      op->bl.append(std::string(in_size,(char)stripe%26+97)); // start with 'a'
+
+      ret = io_ctx.aio_write(name.c_str(), op->completion, op->bl, in_size, 0);
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Write called."
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+      if (ret < 0) {
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't start write object! error at index "
+			    << name << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
+	ret = EXIT_FAILURE;
+	// We have had a failure, so do not execute any further, 
+	// fall through.
+      }
+      insert_pending_op(stripe,op);
+
+      /* throttle...
+       * This block causes the write thread to wait until the number
+       * of outstanding AIO completions is below the number of 
+       * concurrentios that was set in the configuration. Since
+       * the completions queue and the shards_in_flight queue are
+       * a bijection, we are assured of dereferencing the corresponding
+       * buffer once the write has completed.
+       */
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "pending_ops_size "
+			  << get_pending_ops_size() << " > " << concurrentios
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+	
+    } // End of write loop
+  }
+#ifdef TRACE
+  output_lock.lock();
+  std::cerr THREAD_ID << "Write thread exiting now." << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+#endif
+
+  return; // Thread terminates
+}
+/* @writing_done means that the rados has finished writing shards/objects.
+ */
+
+void radosReadThread() {
+  bool started = false;
+
+  int ret;
+  int count = 0;
+  int stripe = 0;
+  std::string name;
+
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting radosReadThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+  }
+
+  // Read loop 
+  while (!reading_done) {
+    // wait for the request to complete, and check that it succeeded.
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID  << "In radosReadThread() outer while loop." << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+
+    while (!is_stripes_queue_empty()) {
+      if ( (stripe = get_stripe()) < 0) {
+	/* When the stripes queue is empty, we have submitted all of the
+	 * work to be done. If by chance another thread grabbed the last
+	 * work item from the stripes queue, then this test will exit now.
+	 */
+	break;
+      }
+
+#ifdef VERBOSITY_1
+      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
+#endif
+      name = obj_name + std::to_string(stripe);
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Created a buffer for object " 
+			  << name << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+
+      CompletionOp *op = new CompletionOp(name);
+      op->completion = rados.aio_create_completion(op, _read_completion_cb, NULL);
+      op->name = name.c_str();
+      op->id = count;
+      op->bl = librados::bufferlist();
+      op->bl.append(std::string(in_size,(char)count%26+97)); // start with 'a'
+
+      ret = io_ctx.aio_read(op->name, op->completion, &op->bl, (uint64_t)in_size, 0);
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "Read called."
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+      if (ret < 0) {
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "couldn't start read object! error at index "
+			    << name << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
+#endif
+	ret = EXIT_FAILURE;
+	// We have had a failure, so do not execute any further, 
+	// fall through.
+      }
+      insert_pending_op(count,op);
+      count++; // Finished with a shard. Increment count for the next one.
+
+      /* throttle...
+       * This block causes the read thread to wait on
+       * the read ops so we don't over demand
+       * the IO system.
+       */
+      while (get_pending_ops_size() > concurrentios) {
+	std::this_thread::sleep_for(read_sleep_duration);
+      }
+    }
+  }  // While loop waiting for reading to be done.
+#ifdef TRACE
+  output_lock.lock();
+  std::cerr THREAD_ID << "Read thread exiting now." << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+#endif
+
+  return; // Thread terminates
 }
 
 namespace po = boost::program_options;
@@ -427,7 +497,7 @@ int main(int argc, const char **argv)
    * create an "IoCtx" which is used to do IO to a pool
    */
   {
-    ret = rados.ioctx_create(pool_name.str(), io_ctx);
+    ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
     if (ret < 0) {
       std::cerr << "couldn't set up ioctx! error " << ret << std::endl;
       ret = EXIT_FAILURE;
@@ -442,112 +512,38 @@ int main(int argc, const char **argv)
    * now let's do some IO to the pool! We'll write "hello world!" to a
    * new object.
    */
-  {
+  if (rados_mode == 0)  {
     /*
-     * "bufferlist"s are Ceph's native transfer type, and are carefully
-     * designed to be efficient about copying. You can fill them
-     * up from a lot of different data types, but strings or c strings
-     * are often convenient. Just make sure not to deallocate the memory
-     * until the bufferlist goes out of scope and any requests using it
-     * have been finished!
+     * Do our writing here.
      */
-    for ( int buffers_created_count = 0;
-	  buffers_created_count<max_iterations;buffers_created_count++) {
-      librados::bufferlist bl;
-      bl.append(std::string(in_size,(char)buffers_created_count%26+97)); // start with 'a'
-
-      /*
-       * now that we have the data to write, let's send it to an object.
-       * We'll use the synchronous interface for simplicity.
-       */
-      ret = io_ctx.write_full(obj_name + "." 
-			      + std::to_string(buffers_created_count), bl);
-      if (ret < 0) {
-	std::cerr << "couldn't write object! error " << ret << std::endl;
-	std::cerr.flush();
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-	std::cout << "we just wrote new object " 
-		  << obj_name + "." + std::to_string(buffers_created_count)
-		  << ", with contents\n" << obj_name << std::endl;
-	std::cout.flush();
-      }
+    for ( int stripe_count = 0;
+	  stripe_count<max_iterations;stripe_count++) {
+      stripes.push(stripe_count);
     }
-  }
-  /*
-   * now let's read that object back! Just for fun, we'll do it using
-   * async IO instead of synchronous. (This would be more useful if we
-   * wanted to send off multiple reads at once; see
-   * http://ceph.com/docs/master/rados/api/librados/#asychronous-io )
-   */
-  {
+    // Start the rados writer thread
+    std::thread rados_thread = (std::thread (radosWriteThread));
+
+    while (!is_stripes_queue_empty())
+      std::this_thread::sleep_for(read_sleep_duration);
+
+    writing_done = true;
+    rados_thread.join();
+  } else if (rados_mode == 1) {
     /*
-     * Prompt user so we wait to do the read.
+     * Read stripes back.
      */
-
-    std::string name;
-    std::cout << "Press enter when ready to proceed with read..." << std::endl;
-    std::getline(std::cin, name);
-    std::cout << "Proceeding to read object back..." << std::endl;
-
-    std::map<int,librados::bufferlist> read_buffers;
-    std::map<int,librados::AioCompletion *> completions;
-    for (int i = 0;i<max_iterations;i++) {
-      librados::bufferlist read_buf;
-      int read_len = in_size;
-      // allocate the completion from librados
-      librados::AioCompletion *read_completion = librados::Rados::aio_create_completion();
-      completions.insert(std::pair<int,librados::AioCompletion *>(i,read_completion));
-      // send off the request.
-      std::string _name = obj_name + "." + std::to_string(i);
-      ret = io_ctx.aio_read(_name.str(), read_completion, &read_buf, read_len, 0);
-      if (ret < 0) {
-	std::cerr << "couldn't start read object! error " << ret << std::endl;
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-	std::cout << "we did aio read on object " << obj_name + "." + std::to_string(i)
-		  << std::endl;
-	std::cout.flush();
-      }
-      read_buffers.insert(std::pair<int,librados::bufferlist>(i,read_buf));
-      std::this_thread::sleep_for(read_sleep_duration);
+    for ( int stripe_count = 0;
+	  stripe_count<max_iterations;stripe_count++) {
+      stripes.push(stripe_count);
     }
+    // Start the rados writer thread
+    std::thread rados_thread = (std::thread (radosReadThread));
 
-    // wait for the request to complete, and check that it succeeded.
-    librados::AioCompletion * read_completion;
-    //    librados::bufferlist read_buf;
-    for (int i = 0;i<max_iterations;i++) {
-      auto it = completions.find(i);
-      if (it != completions.end())
-	read_completion = it->second;
-      else
-	break;
-      read_completion->wait_for_complete();
-      ret = read_completion->get_return_value();
-      if (ret < 0) {
-	std::cerr << "couldn't read object! error " << ret << std::endl;
-	std::cerr.flush();
-	ret = EXIT_FAILURE;
-	goto out;
-      } else {
-	std::cout << "we read our object " << obj_name + "." + std::to_string(i)
-		  << ", and got back " << ret << " bytes with contents"  << std::endl;
-	std::cout.flush();
-	/*
-	std::string read_string;
-	auto it_buf = read_buffers.find(i);
-	if (it_buf != read_buffers.end()) {
-	  read_buf = it_buf->second;
-	  read_buf.copy(0, 20, read_string);
-	  std::cout << read_string << std::endl;
-	std::cout.flush();
-	}
-	*/
-      }
+    while (!is_stripes_queue_empty())
       std::this_thread::sleep_for(read_sleep_duration);
-    }
+
+    reading_done = true;
+    rados_thread.join();
   }
 
 
@@ -559,7 +555,7 @@ int main(int argc, const char **argv)
    * And now we're done, so let's remove our pool and then
    * shut down the connection gracefully.
    */
-  int delete_ret = rados.pool_delete(pool_name.str());
+  int delete_ret = rados.pool_delete(pool_name.c_str());
   if (delete_ret < 0) {
     // be careful not to
     std::cerr << "We failed to delete our test pool!" << std::endl;

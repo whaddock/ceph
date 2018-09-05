@@ -2,7 +2,7 @@ ceph_src = ../../src
 ceph_libs = $(ceph_src)/.libs
 CXXFLAGS=-std=c++11 -I$(ceph_src)/include  -I$(ceph_src)
 CFLAGS=-I$(ceph_src)/include
-LDFLAGS=-L/lib64 -L$(ceph_src) -L$(ceph_libs) -lrados -lradosstriper
+LDFLAGS=-L/usr/lib64 -L/lib64 -L$(ceph_src) -L$(ceph_libs) -lrados -lradosstriper
 
 ceph_erasure_code_benchmark_LDADD =  \
         $(LIBOSD) $(LIBCOMMON) \
@@ -115,8 +115,8 @@ machine_threads: machine_threads.cc
 	g++ -g machine_threads.o  -o machine_threads $(LDFLAGS)
 
 ceph_native_write_benchmark: ceph_native_write_benchmark.cc
-	g++ -g -c ceph_native_write_benchmark.cc  -o $ceph_native_write_benchmark.o $(CXXFLAGS)
-	g++ -g $ceph_native_write_benchmark.o  -o ceph_native_write_benchmark $(LDFLAGS)
+	g++ -g -c ceph_native_write_benchmark.cc  -o ceph_native_write_benchmark.o $(CXXFLAGS)
+	g++ -g ceph_native_write_benchmark.o  -o ceph_native_write_benchmark $(LDFLAGS)
 
 clean:
 	rm hello_world.o librados_hello_world

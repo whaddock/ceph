@@ -551,16 +551,6 @@ int main(int argc, const char **argv)
   out:
   std::cerr << "Exit routine. Results: " << ret << std::endl;
   std::cerr.flush();
-  /*
-   * And now we're done, so let's remove our pool and then
-   * shut down the connection gracefully.
-   */
-  int delete_ret = rados.pool_delete(pool_name.c_str());
-  if (delete_ret < 0) {
-    // be careful not to
-    std::cerr << "We failed to delete our test pool!" << std::endl;
-    ret = EXIT_FAILURE;
-  }
 
   rados.shutdown();
 

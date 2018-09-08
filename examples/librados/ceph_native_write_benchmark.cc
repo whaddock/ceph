@@ -28,8 +28,10 @@
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
-
+#include "common/Clock.h"
 #include <rados/librados.hpp>
+
+#include "include/utime.h"
 #include <iostream>
 #include <string>
 #include <thread>
@@ -39,6 +41,10 @@
 #include <map>
 #include <queue>
 #include <climits>
+
+#define TRACE
+#define VERBOSITY_1
+#define THREAD_ID << ceph_clock_now(g_ceph_context)  << " Thread: " << std::this_thread::get_id() << " | "
 
 #define RADOS_THREADS 1
 #define READ_SLEEP_DURATION 2 // in milliseconds
@@ -116,12 +122,14 @@ void io_cb(librados::completion_t c, CompletionOp *op) {
   std::lock_guard<std::mutex> guard(pending_ops_lock);
 
   std::map<int, CompletionOp *>::iterator iter = pending_ops.find(op->id);
-  if (iter != pending_ops.end())
-    pending_ops.erase(iter);
-
+  int ret = op->completion->get_return_value();
+  std::cout << op->name << " callback return value: " << ret << std::endl;
   op->completion->release();
+
   delete op;
   //  std::cout << "-";
+  if (iter != pending_ops.end())
+    pending_ops.erase(iter);
 }
 
 static void _completion_cb(librados::completion_t c, void *param)
@@ -134,13 +142,14 @@ void read_cb(librados::completion_t c, CompletionOp *op) {
   std::lock_guard<std::mutex> guard(pending_ops_lock);
 
   std::map<int, CompletionOp *>::iterator iter = pending_ops.find(op->id);
-  if (iter != pending_ops.end())
-    pending_ops.erase(iter);
-
+  int ret = op->completion->get_return_value();
+  std::cout << op->name << " callback return value: " << ret << std::endl;
   op->completion->release();
 
   delete op;
   //  std::cout << "-";
+  if (iter != pending_ops.end())
+    pending_ops.erase(iter);
 }
 
 static void _read_completion_cb(librados::completion_t c, void *param)
@@ -178,21 +187,29 @@ void radosWriteThread() {
 	break;
       }
 
-      name = obj_name + std::to_string(stripe);
-#ifdef VERBOSITY_1
-      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
-#endif
-      CompletionOp *op = new CompletionOp(name);
+      std::stringstream name;
+      name << obj_name << stripe;
+      CompletionOp *op = new CompletionOp(name.str());
       op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
       op->id = stripe;
       op->bl = librados::bufferlist();
       op->bl.append(std::string(in_size,(char)stripe%26+97)); // start with 'a'
 
-      ret = io_ctx.aio_write(name.c_str(), op->completion, op->bl, in_size, 0);
+#ifdef VERBOSITY_1
+      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
+      std::cout THREAD_ID << "op->id: " << op->id << std::endl;
+      std::cout THREAD_ID << "name: " << op->name << std::endl;
+      std::string sample;
+      op->bl.copy((unsigned int)0, (unsigned int)10, sample);
+      std::cout THREAD_ID << "bufferlist sample text: " << sample << std::endl;
+      std::cout THREAD_ID << "bufferlist length: " << op->bl.length() << std::endl;
+#endif
+
+      ret = io_ctx.aio_write_full(op->name, op->completion, op->bl);
+
 #ifdef TRACE
       output_lock.lock();
-      std::cerr THREAD_ID << "Write called."
-			  << std::endl;
+      std::cerr THREAD_ID << "Write call returned:" << ret << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -208,6 +225,7 @@ void radosWriteThread() {
 	// We have had a failure, so do not execute any further, 
 	// fall through.
       }
+
       insert_pending_op(stripe,op);
 
       /* throttle...
@@ -426,16 +444,16 @@ int setup(int argc, const char** argv) {
 int main(int argc, const char **argv)
 {
   int ret = 0;
+  utime_t begin_time_final = ceph_clock_now(g_ceph_context);
+  utime_t end_time_final = ceph_clock_now(g_ceph_context);
+  long long int total_data_processed = 0;
 
   // Get the arguments from the command line
   setup(argc, argv);
 
   // we will use all of these below
-  librados::IoCtx io_ctx;
-  const std::chrono::milliseconds read_sleep_duration(100);
 
   // first, we create a Rados object and initialize it
-  librados::Rados rados;
   {
     ret = rados.init("admin"); // just use the client.admin keyring
     if (ret < 0) { // let's handle any error that might have come back
@@ -528,6 +546,7 @@ int main(int argc, const char **argv)
 
     writing_done = true;
     rados_thread.join();
+
   } else if (rados_mode == 1) {
     /*
      * Read stripes back.
@@ -546,6 +565,26 @@ int main(int argc, const char **argv)
     rados_thread.join();
   }
 
+  // wait for the pending operations to finish
+  while (get_pending_ops_size() > 0)
+    std::this_thread::sleep_for(read_sleep_duration);
+
+#ifdef TRACE
+  std::cout << "*** Tracing is on, output is to STDERR. ***" << std::endl;
+  std::cout << "Factors for computing size: max_iterations: " << max_iterations << std::endl
+	    << " object size: " << in_size << std::endl
+	    << " total data size: " << max_iterations*in_size
+	    << " bandwidth: " << (long long int)max_iterations*in_size/(1024*1024)
+	    << std::endl << std::endl;
+#endif
+
+  end_time_final = ceph_clock_now(g_ceph_context);
+  total_data_processed = (long long int)max_iterations*in_size/(1024*1024);
+  std::cout << "Total Time (S)\t" << "Total Data (MB)\t" << "Bandwidth (MiB/S)" << std::endl;
+  std::cout << (end_time_final - begin_time_final) << "\t" << total_data_processed 
+	    << "\t" << total_data_processed/(double)(end_time_final - begin_time_final) 
+	    << std::endl;
+  std::cout.flush();
 
   ret = EXIT_SUCCESS;
   out:

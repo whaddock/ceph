@@ -42,8 +42,8 @@
 #include <queue>
 #include <climits>
 
-#define TRACE
-#define VERBOSITY_1
+//#define TRACE
+//#define VERBOSITY_1
 #define THREAD_ID << ceph_clock_now(g_ceph_context)  << " Thread: " << std::this_thread::get_id() << " | "
 
 #define RADOS_THREADS 1
@@ -64,8 +64,10 @@ const std::chrono::milliseconds read_sleep_duration(READ_SLEEP_DURATION);
 // Locks for containers sharee with the handleAioCompletions thread.
 std::mutex output_lock;
 std::mutex stripes_lock;
+std::mutex objs_lock;
 std::mutex completions_lock;
 std::mutex pending_ops_lock;
+std::mutex bs_ops_lock;
 std::mutex cout_lock;
 
 struct CompletionOp {
@@ -76,14 +78,34 @@ struct CompletionOp {
 
   explicit CompletionOp(std::string _name) : id(0), name(_name), completion(NULL) {}
 };
+std::map<int,CompletionOp *> bs_ops, pending_ops;
 
-std::map<int,CompletionOp *> pending_ops;
+// Object information. We stripe over these objects.
+struct obj_info {
+  string name;
+  int id;
+  size_t len;
+
+  explicit obj_info(std::string _name) : name(_name), id(0), len(0) {}
+};
+std::queue<obj_info *> objs;
 
 // guarded queue accessor functions
 void print_message(std::string message) {
   std::lock_guard<std::mutex> guard(cout_lock);
   std::cout << message << std::endl;
   std::cout.flush();
+}
+
+int get_bs_ops_size() { 
+  std::lock_guard<std::mutex> guard(bs_ops_lock);
+  return bs_ops.size();
+}
+
+void insert_bs_op(int index, CompletionOp *op) {
+  std::lock_guard<std::mutex> guard(bs_ops_lock);
+  bs_ops.insert(std::pair<int,CompletionOp *>(index,op));
+  return;
 }
 
 int get_pending_ops_size() { 
@@ -118,12 +140,61 @@ bool is_stripes_queue_empty() {
   std::lock_guard<std::mutex> guard(stripes_lock);
   return stripes.empty();
 }
+
+void insert_objs(obj_info *info) {
+  std::lock_guard<std::mutex> guard(objs_lock);
+  objs.push(info);
+  return;
+}
+
+int get_objs_queue_size() { 
+  std::lock_guard<std::mutex> guard(objs_lock);
+  return objs.size();
+}
+
+obj_info* get_objs() {
+  std::lock_guard<std::mutex> guard(objs_lock);
+  // Caller must trap exceptions
+  obj_info *stripe = objs.front();
+  objs.pop();
+  return stripe;
+}
+
+bool is_objs_queue_empty() {
+  std::lock_guard<std::mutex> guard(objs_lock);
+  return objs.empty();
+}
+
+// Bootstrap Completion object
+void bs_cb(librados::completion_t c, CompletionOp *op) {
+  std::lock_guard<std::mutex> guard(bs_ops_lock);
+
+  std::map<int, CompletionOp *>::iterator iter = bs_ops.find(op->id);
+  int ret = op->completion->get_return_value();
+  //  std::cout << op->name << " callback return value: " << ret << std::endl;
+  op->completion->release();
+  obj_info *info = new obj_info(op->name);
+  info->id = op->id;
+  insert_objs(info);
+  delete op;
+  std::cout << "Inserted " << info->name << std::endl;
+  if (iter != bs_ops.end())
+    bs_ops.erase(iter);
+}
+
+static void _bs_completion_cb(librados::completion_t c, void *param)
+{
+  CompletionOp *op = (CompletionOp *)param;
+  bs_cb(c, op);
+}
+
+// Write Completion object
 void io_cb(librados::completion_t c, CompletionOp *op) {
   std::lock_guard<std::mutex> guard(pending_ops_lock);
 
   std::map<int, CompletionOp *>::iterator iter = pending_ops.find(op->id);
   int ret = op->completion->get_return_value();
-  std::cout << op->name << " callback return value: " << ret << std::endl;
+  //  std::cout << op->name << " callback return value: " << ret << std::endl;
   op->completion->release();
 
   delete op;
@@ -143,7 +214,7 @@ void read_cb(librados::completion_t c, CompletionOp *op) {
 
   std::map<int, CompletionOp *>::iterator iter = pending_ops.find(op->id);
   int ret = op->completion->get_return_value();
-  std::cout << op->name << " callback return value: " << ret << std::endl;
+  //  std::cout << op->name << " callback return value: " << ret << std::endl;
   op->completion->release();
 
   delete op;
@@ -158,10 +229,72 @@ static void _read_completion_cb(librados::completion_t c, void *param)
   read_cb(c, op);
 }
 
+/* Function used for bootstrap thread
+ */
+void bootstrapThread()
+{
+  int ret = 0;
+  int buf_len = 1;
+  int stripe = 0;
+  string name;
+
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Starting bootstrapThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+
+  while (!is_stripes_queue_empty()) {
+    if ( (stripe = get_stripe()) < 0) {
+      /* When the stripes queue is empty, we have submitted all of the
+       * work to be done. If by chance another thread grabbed the last
+       * work item from the stripes queue, then this test will exit now.
+       */
+      break;
+    }
+
+    std::stringstream name;
+    name << obj_name << stripe;
+    bufferptr p = buffer::create(buf_len);
+    bufferlist bl;
+    memset(p.c_str(), 0, buf_len);
+    bl.push_back(p);
+
+#ifdef TRACE
+    output_lock.lock();
+    std::cerr THREAD_ID << "Creating object: " << name.str()
+			<< std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
+
+    CompletionOp *op = new CompletionOp(name.str());
+    op->completion = rados.aio_create_completion(op, _bs_completion_cb, NULL);
+    op->id = stripe;
+    op->bl = bl;
+
+    // generate object
+    ret = io_ctx.aio_write(op->name, op->completion, op->bl, buf_len, in_size - buf_len);
+    if (ret < 0) {
+      cerr << "couldn't write obj: " << name.str() << " ret=" << ret << std::endl;
+    }
+    else {
+      insert_bs_op(stripe,op);
+    }
+  }
+#ifdef TRACE
+  output_lock.lock();
+  std::cerr THREAD_ID << "Bootstrap thread exiting now." << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
+#endif
+}
+
 void radosWriteThread() {
   bool started = false;
   int ret;
-  int stripe = 0;
+  obj_info *info;
   string name;
 
   if(!started) {
@@ -178,74 +311,82 @@ void radosWriteThread() {
   while (!writing_done) {
     // wait for the request to complete, and check that it succeeded.
 
-    while (!is_stripes_queue_empty()) {
-      if ( (stripe = get_stripe()) < 0) {
-	/* When the stripes queue is empty, we have submitted all of the
-	 * work to be done. If by chance another thread grabbed the last
-	 * work item from the stripes queue, then this test will exit now.
-	 */
-	break;
-      }
+#ifdef TRACEX
+    output_lock.lock();
+    std::cerr THREAD_ID << "Write Loop entered in  radosWriteThread()" << std::endl;
+    std::cerr.flush();
+    output_lock.unlock();
+#endif
 
-      std::stringstream name;
-      name << obj_name << stripe;
-      CompletionOp *op = new CompletionOp(name.str());
-      op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
-      op->id = stripe;
-      op->bl = librados::bufferlist();
-      op->bl.append(std::string(in_size,(char)stripe%26+97)); // start with 'a'
+    try {
+      while (!is_objs_queue_empty()) {
+	info = get_objs();
+
+	std::stringstream name;
+	CompletionOp *op = new CompletionOp(info->name);
+	op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
+	op->id = info->id;
+	op->bl = librados::bufferlist();
+	op->bl.append(std::string(in_size,(char)info->id%26+97)); // start with 'a'
 
 #ifdef VERBOSITY_1
-      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
-      std::cout THREAD_ID << "op->id: " << op->id << std::endl;
-      std::cout THREAD_ID << "name: " << op->name << std::endl;
-      std::string sample;
-      op->bl.copy((unsigned int)0, (unsigned int)10, sample);
-      std::cout THREAD_ID << "bufferlist sample text: " << sample << std::endl;
-      std::cout THREAD_ID << "bufferlist length: " << op->bl.length() << std::endl;
+	std::cout THREAD_ID << "Processing stripe " << info->id << std::endl;
+	std::cout THREAD_ID << "op->id: " << op->id << std::endl;
+	std::cout THREAD_ID << "name: " << op->name << std::endl;
+	std::string sample;
+	op->bl.copy((unsigned int)0, (unsigned int)10, sample);
+	std::cout THREAD_ID << "bufferlist sample text: " << sample << std::endl;
+	std::cout THREAD_ID << "bufferlist length: " << op->bl.length() << std::endl;
 #endif
 
-      ret = io_ctx.aio_write_full(op->name, op->completion, op->bl);
+	ret = io_ctx.aio_write_full(op->name, op->completion, op->bl);
 
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Write call returned:" << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
-      if (ret < 0) {
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "couldn't start write object! error at index "
-			    << name << std::endl;
+	std::cerr THREAD_ID << "Write call returned:" << ret << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	ret = EXIT_FAILURE;
-	// We have had a failure, so do not execute any further, 
-	// fall through.
-      }
-
-      insert_pending_op(stripe,op);
-
-      /* throttle...
-       * This block causes the write thread to wait until the number
-       * of outstanding AIO completions is below the number of 
-       * concurrentios that was set in the configuration. Since
-       * the completions queue and the shards_in_flight queue are
-       * a bijection, we are assured of dereferencing the corresponding
-       * buffer once the write has completed.
-       */
+	if (ret < 0) {
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "pending_ops_size "
-			  << get_pending_ops_size() << " > " << concurrentios
-			  << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "couldn't start write object! error at index "
+			      << name << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+#endif
+	  ret = EXIT_FAILURE;
+	  // We have had a failure, so do not execute any further, 
+	  // fall through.
+	}
+
+	insert_pending_op(info->id,op);
+
+	/* throttle...
+	 * This block causes the write thread to wait until the number
+	 * of outstanding AIO completions is below the number of 
+	 * concurrentios that was set in the configuration. Since
+	 * the completions queue and the shards_in_flight queue are
+	 * a bijection, we are assured of dereferencing the corresponding
+	 * buffer once the write has completed.
+	 */
+#ifdef TRACE
+	output_lock.lock();
+	std::cerr THREAD_ID << "pending_ops_size "
+			    << get_pending_ops_size() << " > " << concurrentios
+			    << std::endl;
+	std::cerr.flush();
+	output_lock.unlock();
 #endif
 	
-    } // End of write loop
+      } // End of write loop
+    }
+    catch (...) {
+	/* anything, mostly if we try to get another item from the queue but
+	 * it is already empty because we have multiple threads.
+	 */ 
+	continue; 
+    }
   }
 #ifdef TRACE
   output_lock.lock();
@@ -287,66 +428,59 @@ void radosReadThread() {
     output_lock.unlock();
 #endif
 
-    while (!is_stripes_queue_empty()) {
-      if ( (stripe = get_stripe()) < 0) {
-	/* When the stripes queue is empty, we have submitted all of the
-	 * work to be done. If by chance another thread grabbed the last
-	 * work item from the stripes queue, then this test will exit now.
-	 */
-	break;
-      }
+    try {
+      while (!is_stripes_queue_empty()) {
+	stripe = get_stripe();
+	name = obj_name + std::to_string(stripe);
 
-#ifdef VERBOSITY_1
-      std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
-#endif
-      name = obj_name + std::to_string(stripe);
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Created a buffer for object " 
-			  << name << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
+	CompletionOp *op = new CompletionOp(name);
+	op->completion = rados.aio_create_completion(op, _read_completion_cb, NULL);
+	op->name = name.c_str();
+	op->id = count;
+	op->bl = librados::bufferlist();
+	op->bl.append(std::string(in_size,(char)count%26+97)); // start with 'a'
 
-      CompletionOp *op = new CompletionOp(name);
-      op->completion = rados.aio_create_completion(op, _read_completion_cb, NULL);
-      op->name = name.c_str();
-      op->id = count;
-      op->bl = librados::bufferlist();
-      op->bl.append(std::string(in_size,(char)count%26+97)); // start with 'a'
-
-      ret = io_ctx.aio_read(op->name, op->completion, &op->bl, (uint64_t)in_size, 0);
-#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Read called."
-			  << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-#endif
-      if (ret < 0) {
+	ret = io_ctx.aio_read(op->name, op->completion, &op->bl, (uint64_t)in_size, 0);
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "couldn't start read object! error at index "
-			    << name << std::endl;
+	std::cerr THREAD_ID << "Read called."
+			    << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
-	ret = EXIT_FAILURE;
-	// We have had a failure, so do not execute any further, 
-	// fall through.
-      }
-      insert_pending_op(count,op);
-      count++; // Finished with a shard. Increment count for the next one.
+	if (ret < 0) {
+#ifdef TRACE
+	  output_lock.lock();
+	  std::cerr THREAD_ID << "couldn't start read object! error at index "
+			      << name << std::endl;
+	  std::cerr.flush();
+	  output_lock.unlock();
+#endif
+	  ret = EXIT_FAILURE;
+	  // We have had a failure, so do not execute any further, 
+	  // fall through.
+	}
+	insert_pending_op(count,op);
+	count++; // Finished with a shard. Increment count for the next one.
 
-      /* throttle...
-       * This block causes the read thread to wait on
-       * the read ops so we don't over demand
-       * the IO system.
-       */
-      while (get_pending_ops_size() > concurrentios) {
-	std::this_thread::sleep_for(read_sleep_duration);
+	/* throttle...
+	 * This block causes the read thread to wait on
+	 * the read ops so we don't over demand
+	 * the IO system.
+	 */
+	while (get_pending_ops_size() > concurrentios) {
+	  std::this_thread::sleep_for(read_sleep_duration);
+	}
       }
     }
+    catch (...) 
+      { 
+	/* anything, mostly if we try to get another item from the queue but
+	 * it is already empty because we have multiple threads.
+	 */ 
+	continue; 
+      }
+
   }  // While loop waiting for reading to be done.
 #ifdef TRACE
   output_lock.lock();
@@ -531,6 +665,9 @@ int main(int argc, const char **argv)
    * new object.
    */
   if (rados_mode == 0)  {
+    // Bootstrap the objects in the object store
+    std::thread bsThread = std::thread (bootstrapThread);
+
     /*
      * Do our writing here.
      */
@@ -541,9 +678,12 @@ int main(int argc, const char **argv)
     // Start the rados writer thread
     std::thread rados_thread = (std::thread (radosWriteThread));
 
-    while (!is_stripes_queue_empty())
+    while (get_bs_ops_size() > 0)
       std::this_thread::sleep_for(read_sleep_duration);
+    bsThread.join();
 
+    while (!is_objs_queue_empty())
+      std::this_thread::sleep_for(read_sleep_duration);
     writing_done = true;
     rados_thread.join();
 

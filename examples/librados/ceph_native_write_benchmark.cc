@@ -177,7 +177,7 @@ void bs_cb(librados::completion_t c, CompletionOp *op) {
   info->id = op->id;
   insert_objs(info);
   delete op;
-  std::cout << "Inserted " << info->name << std::endl;
+  // std::cout << "Inserted " << info->name << std::endl;
   if (iter != bs_ops.end())
     bs_ops.erase(iter);
 }

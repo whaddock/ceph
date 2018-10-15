@@ -51,8 +51,8 @@
 #include <cassert>
 #include <chrono>
 
-/* #define TRACE 
-   #define VERBOSITY_1 */
+#define TRACE 
+#define VERBOSITY_1 */
 #define RADOS_THREADS 1
 
 #ifndef EC_THREADS
@@ -85,9 +85,11 @@
 
 // Globals for program
 int iterations = 0;
+int in_size = 0;
 int queue_size = 0;
 int shard_size = 0;
 int stripe_size = 0;
+int object_sets = 0;
 std::string obj_name;
 std::string pool_name;
 int ret = 0;
@@ -138,6 +140,7 @@ std::mutex pending_buffers_queue_lock;
 std::mutex write_buffers_waiting_lock;
 std::mutex pending_ops_lock;
 std::mutex cout_lock;
+std::mutex objs_lock;
 
 // Object information. We stripe over these objects.
 struct obj_info {
@@ -163,6 +166,22 @@ void print_message(std::string message) {
   std::lock_guard<std::mutex> guard(cout_lock);
   std::cout << message << std::endl;
   std::cout.flush();
+}
+
+int get_objs_size() { 
+  std::lock_guard<std::mutex> guard(objs_lock);
+  return objs.size();
+}
+
+void insert_objs(int _index, obj_info _info) {
+  std::lock_guard<std::mutex> guard(objs_lock);
+  objs[_index] = _info;
+  return;
+}
+
+obj_info get_obj_info(int _index) {
+  std::lock_guard<std::mutex> guard(objs_lock);
+  return objs[_index];
 }
 
 int get_pending_ops_size() { 
@@ -452,48 +471,83 @@ void initRadosIO() {
  */
 void bootstrapThread()
 {
+  /* Object Sets: Ceph objects can contain about 80 MB by design so we have to 
+   * store our stripes in Object Sets that consist of 80 MB objects. If we are
+   * writing 8 MB shards, then we can do about 10 stripes per Object Set.
+   * The logic in the bootstrapThread will produce enough Object Sets for our
+   * benchmark according to the shard size and the number of stripes to write.
+   * The read and write threads will need to apply the same logic in order to
+   * use the appropriate Object Set for their operation.
+   * int iterations: a global that contains a value indicating the number of stripes
+   * to be processed.
+   * int shard_size: a global int that contains a value indicating the size of
+   * the shards.
+   * int object_set: an int that selects the Object Set, part of the object name.
+   * The object_set value is computed with the following formula:
+   * ceil(stripe_number * shard_size) / in_size )
+   * The bootstrapThread will create all of the Object Sets using the following formula:
+   * floor(iterations * shard_size) / in_size )
+   * shard_size must be a factor of in_size. Specifically, shard_size * stripe_size = in_size.
+   */
+
 #ifdef TRACE
   output_lock.lock();
   std::cerr THREAD_ID << "Started bootstrapThread()" << std::endl;
+  std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
+  std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
+  std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
   std::cerr.flush();
   output_lock.unlock();
 #endif
 
   int buf_len = 1;
+  int index = 0;
 
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting to init objects for writing..."
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+  output_lock.lock();
+  std::cerr THREAD_ID << "object_sets: " << object_sets << std::endl;
+  std::cerr THREAD_ID << "Starting to init objects for writing..."
+		      << std::endl;
+  std::cerr.flush();
+  output_lock.unlock();
 #endif
-  for (int index = 0; index < stripe_size; index++) {
-    obj_info info = objs[index];
+  for (int object_set = 0; object_set < object_sets; object_set++) {
+    for (int shard = 0; shard < stripe_size; shard++) {
+
+    // Create the data structure for the objects we will use
+      obj_info info;
+      std::stringstream object_name;
+      object_name << obj_name << "." << object_set << "." << shard;
+      info.name = object_name.str();
+      info.len = in_size;
+      // Single thread here, no locking required.
+      index = object_set * stripe_size + shard;
+      insert_objs(index,info);
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Creating object: " << info.name
-			<< std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+      output_lock.lock();
+      std::cerr THREAD_ID << "Creating object: " << info.name
+			  << std::endl;
+      std::cerr THREAD_ID << "index:: " << index << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
 #endif
-    bufferptr p = buffer::create(buf_len);
-    bufferlist bl;
-    memset(p.c_str(), 0, buf_len);
-    bl.push_back(p);
+      bufferptr p = buffer::create(buf_len);
+      bufferlist bl;
+      memset(p.c_str(), 0, buf_len);
+      bl.push_back(p);
 
-    CompletionOp *op = new CompletionOp(info.name);
-    op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
-    op->id = index;
-    op->bl = bl;
+      CompletionOp *op = new CompletionOp(info.name);
+      op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
+      op->id = index;
+      op->bl = bl;
 
-    // generate object
-    ret = io_ctx.aio_write(info.name, op->completion, op->bl, buf_len, info.len - buf_len);
-    if (ret < 0) {
-      cerr << "couldn't write obj: " << info.name << " ret=" << ret << std::endl;
+      // generate object
+      ret = io_ctx.aio_write(info.name, op->completion, op->bl, buf_len, info.len - buf_len);
+      if (ret < 0) {
+	cerr << "couldn't write obj: " << info.name << " ret=" << ret << std::endl;
+      }
     }
   }
-
 #ifdef TRACE
   output_lock.lock();
   std::cerr THREAD_ID << "Finished bootstrapThread(), exiting." << std::endl;
@@ -505,11 +559,11 @@ void bootstrapThread()
 void radosWriteThread() {
   bool started = false;
   int ret;
-  uint32_t shard_counter = 0;
   uint32_t stripe = 0;
   uint32_t index = 0;
   uint32_t offset = 0;
   string name;
+  int object_set = 0;
 
   if(!started) {
     started = true;
@@ -531,33 +585,35 @@ void radosWriteThread() {
     }
     else {
       shard = pending_buffers_queue_pop();
-
-      stripe = shard_counter / stripe_size;
-      offset = stripe * shard_size;
-      index = shard_counter % stripe_size;
-      name = objs[index].name;
+      stripe = shard.get_stripe();
+      object_set = stripe * shard_size / in_size;
+      offset = stripe * shard_size - object_set * in_size;
+      index = object_set * stripe_size + shard.get_shard();
+      obj_info info = get_obj_info(index);
+      name = shard.get_object_name();
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID  << "pbit: pending_buffers size (" << get_pending_buffers_queue_size()
 			   << ")" << std::endl;
-      std::cerr THREAD_ID  << "pbit: Writing " << shard.get_object_name()
+      std::cerr THREAD_ID  << "pbit: Writing " << name
 			   << " Hash: " << shard.get_hash()
 			   << " Shard Object stripe position: " << shard.get_shard()
 			   << " Shard Object stripe number: " << shard.get_stripe()
 			   << " to storage." << std::endl;
-      std::cerr THREAD_ID  << "shard: " << shard_counter << " stripe: " << stripe
+      std::cerr THREAD_ID  << "shard: " << shard.get_shard() << " stripe: " << stripe
 			   << " offset: " << offset << " ObjectID: "
 			   << name << std::endl;
-      std::cerr THREAD_ID << "index: " << shard.get_hash()
+      std::cerr THREAD_ID << "index: " << index
 			  << " In do_write. Pending buffer erased in radosWriteThread()"
 			  << std::endl;
+      std::cerr THREAD_ID << "object_set: " << object_set << std::endl;
       std::cerr.flush();
       output_lock.unlock();
 #endif
 
       CompletionOp *op = new CompletionOp(name);
       op->completion = rados.aio_create_completion(op, _completion_cb, NULL);
-      op->id = shard.get_hash();
+      op->id = index;
       op->bl = shard.get_bufferlist();
 
       ret = io_ctx.aio_write(name, op->completion, op->bl, shard_size, offset);
@@ -594,7 +650,6 @@ void radosWriteThread() {
       std::cerr.flush();
       output_lock.unlock();
 #endif
-      shard_counter += 1; // The next shard we will do.
 
       /* throttle...
        * This block causes the write thread to wait until the number
@@ -649,6 +704,7 @@ void radosReadThread(ErasureCodeBench ecbench) {
   // For this thread
   uint32_t offset = 0;
   Shard shard;
+  int object_set = 0;
 
   if(!started) {
     started = true;
@@ -682,18 +738,39 @@ void radosReadThread(ErasureCodeBench ecbench) {
 #ifdef VERBOSITY_1
       std::cout THREAD_ID << "Processing stripe " << stripe << std::endl;
 #endif
-      // On the read benchmark, we only read K shards from Ceph.
-      for (int i=0;i<K;i++) {
-	obj_info info = objs[i];
-	index = stripe*stripe_size+i; // index == data.get_hash()
-	Shard data(stripe,i,stripe_size,info.name);
-	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+
+      object_set = stripe * shard_size / in_size;
+      offset = stripe * shard_size - object_set * in_size;
+
+      /* On the read benchmark, we only read K shards from Ceph.
+       * We do not use the bootstrap here because we create the obj_info
+       * in this thread.
+       */
+      for (int i_shard=0;i_shard<K;i_shard++) {
+
+	std::stringstream object_name;
+	obj_info info;
+	object_name << obj_name << "." << object_set << "." << i_shard;
+	info.name = object_name.str();
+	info.len = in_size;
+	index = object_set * stripe_size + i_shard;
+	insert_objs(index,info);
+	Shard data(stripe,i_shard,stripe_size,info.name);
 	librados::bufferlist bl = librados::bufferlist();
+	// We create the buffer with data that will be overwritten.
 	bl.append(std::string(shard_size,(char)count%26+97)); // start with 'a'
 #ifdef TRACE
 	output_lock.lock();
 	std::cerr THREAD_ID << "Created a Shard for encoding with hash value " 
 			    << data.get_hash() << std::endl;
+	std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
+	std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
+	std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
+	std::cerr THREAD_ID  << "shard: " << shard.get_shard() << " stripe: " << stripe
+			     << " offset: " << offset << " ObjectID: "
+			     << info.name << std::endl;
+	std::cerr THREAD_ID << "index: " << index << std::endl;
+	std::cerr THREAD_ID << "object_set: " << object_set << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
@@ -848,6 +925,7 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
   bool started = false;
   int stripe = 0;
   int buffers_created_count = 0;
+  int object_set = 0;
   Shard shard;
   map<int,Shard>::iterator stripe_it;
   map<int,librados::bufferlist> encoded;
@@ -871,20 +949,37 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 	break;
       }
 
+#ifdef TRACE
+      output_lock.lock();
+      std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
+      std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
+      std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
+      std::cerr THREAD_ID << "object_sets: " << object_sets << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+      int index = 0;
+      object_set = stripe * shard_size / in_size;
       map<int,Shard> m_stripe;
-      int i = 0;
-      for (int index =stripe*stripe_size;index<(1+stripe)*stripe_size;index++, i++) {
-	obj_info info = objs[index];
-	Shard data(stripe,i,stripe_size,info.name);
-	assert(index==data.get_hash()); // disable assert checking by defining #NDEBUG
+      for (int shard=0;shard<K;shard++) {
+	// Create the data structure for the objects we will use
+	index = object_set * stripe_size + shard;
+	while (object_set + 1 < get_objs_size() / stripe_size)
+	  std::this_thread::sleep_for(thread_sleep_duration);
+	obj_info info = get_obj_info(index);
+
+	Shard data(stripe,shard,stripe_size,info.name);
 	librados::bufferlist bl = librados::bufferlist();
 	bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
 	data.set_bufferlist(bl);
-	m_stripe.insert( std::pair<int,Shard>(i,data));
+	m_stripe.insert( std::pair<int,Shard>(shard,data));
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "Created a Shard for encoding with hash value " << data.get_hash() << 
-	  std::endl;
+	std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
+	std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
+	std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
+	std::cerr THREAD_ID << "Created a Shard for encoding with hash value " << index << std::endl;
+	std::cerr THREAD_ID << "object_sets: " << object_sets << std::endl;
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
@@ -907,7 +1002,7 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
       std::cerr.flush();
       output_lock.unlock();
 #endif
-      ret = ecbench.encode(&encoded);
+      //      ret = ecbench.encode(&encoded);
       while (get_pending_buffers_queue_size() > ecbench.queue_size) {
 	std::this_thread::sleep_for(thread_sleep_duration);
       }
@@ -1430,11 +1525,14 @@ int main(int argc, const char** argv) {
     stripe_size = ecbench.stripe_size;
     queue_size = ecbench.queue_size;
     shard_size = ecbench.shard_size;
+    in_size = ecbench.in_size;
     obj_name = ecbench.obj_name;
     pool_name = ecbench.pool_name;
     K = ecbench.k;
     M = ecbench.m;
     v_erased = ecbench.erased;
+    object_sets = iterations * shard_size / in_size;
+
     std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
     std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
     std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
@@ -1445,17 +1543,6 @@ int main(int argc, const char** argv) {
     // store the program inputs in the global vars for access by threads
     _argc = argc;
     _argv = argv;
-
-    // Create the data structure for the objects we will use
-    for (int index = 0; index < stripe_size; index++) {
-      obj_info info;
-      std::stringstream object_name;
-      object_name << obj_name << "." << index;
-      info.name = object_name.str();
-      info.len = iterations * shard_size;
-      // Single thread here, no locking required.
-      objs[index] = info;
-    }
 
     // Initialize the stripes list
     // Single thread here, no locking required.
@@ -1703,8 +1790,11 @@ int main(int argc, const char** argv) {
     std::cout << "*** Tracing is on, output is to STDERR. ***" << std::endl;
     std::cout << "Factors for computing size: iterations: " << iterations
 	      << " max_iterations: " << ecbench.max_iterations << std::endl
-	      << " stripe_size: " << stripe_size 
-	      << " shard_size: " << shard_size 
+	      << " stripe_size: " << stripe_size << std::endl
+	      << " K: " << K << std::endl
+	      << " M: " << M << std::endl
+	      << " Threads: " << ec_threads << std::endl
+	      << " shard_size: " << shard_size << std::endl
 	      << " total data processed: " << total_data_processed << " KiB"
 	      << std::endl;
 #endif

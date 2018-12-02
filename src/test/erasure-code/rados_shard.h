@@ -29,6 +29,10 @@ class Shard {
     read = true;
   }
 
+  int get_bufferlist_size() {
+    return bl.length();
+  }
+
   librados::bufferlist get_bufferlist() {
     return bl;
   }

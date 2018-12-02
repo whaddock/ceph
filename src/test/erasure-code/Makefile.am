@@ -12,7 +12,7 @@ ceph_erasure_code_benchmark_SOURCES = \
 	test/erasure-code/ceph_erasure_code_benchmark.cc
 ceph_erasure_code_benchmark_LDADD = $(LIBOSD) $(LIBCOMMON) $(BOOST_PROGRAM_OPTIONS_LIBS) $(CEPH_GLOBAL) -lrados
 if LINUX
-ceph_erasure_code_benchmark_LDADD += -ldl
+ceph_erasure_code_benchmark_LDADD += -ldl -lcrypto -lstdc++
 endif
 bin_DEBUGPROGRAMS += ceph_erasure_code_benchmark
 

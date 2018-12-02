@@ -51,6 +51,13 @@
 #include <cassert>
 #include <chrono>
 
+// OpenSSL for encryption
+#include <openssl/aes.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <algorithm>
+#include <stdexcept>
+
 //#define TRACE 
 //#define VERBOSITY_1 */
 #define RADOS_THREADS 1
@@ -103,6 +110,7 @@ const std::chrono::milliseconds thread_sleep_duration(THREAD_SLEEP_DURATION);
 const std::chrono::milliseconds shutdown_sleep_duration(SHUTDOWN_SLEEP_DURATION);
 librados::Rados rados;
 librados::IoCtx io_ctx;
+std::string aes_key; // AES-256 encryption key
 
 // Create queues, maps and iterators used by the main and thread functions.
 std::queue<int> stripes;
@@ -117,6 +125,7 @@ std::thread report_thread;
 std::thread bsThread;
 std::thread ecThread;
 std::thread prThread;
+bool is_encrypting = false;
 bool g_is_encoding = false;
 bool reporting_done = false; // Becomes true at end of shutdown.
 bool aio_done = false; //Becomes true at the end when we all aio operations are finished
@@ -359,6 +368,112 @@ static void _read_completion_cb(librados::completion_t c, void *param)
 {
   CompletionOp *op = (CompletionOp *)param;
   read_cb(c, op);
+}
+
+// Used to convert AES key to human readable form
+std::string string_to_hex(const std::string& input)
+{
+  static const char* const lut = "0123456789ABCDEF";
+  size_t len = input.length();
+
+  std::string output;
+  output.reserve(2 * len);
+  for (size_t i = 0; i < len; ++i)
+    {
+      const unsigned char c = input[i];
+      output.push_back(lut[c >> 4]);
+      output.push_back(lut[c & 15]);
+    }
+  return output;
+}
+
+// Used to convert AES key from hex to string  
+std::string hex_to_string(const std::string& input)
+{
+  static const char* const lut = "0123456789ABCDEF";
+  size_t len = input.length();
+  if (len & 1) throw std::invalid_argument("odd length");
+
+  std::string output;
+  output.reserve(len / 2);
+  for (size_t i = 0; i < len; i += 2)
+    {
+      char a = input[i];
+      const char* p = std::lower_bound(lut, lut + 16, a);
+      if (*p != a) throw std::invalid_argument("not a hex digit");
+
+      char b = input[i + 1];
+      const char* q = std::lower_bound(lut, lut + 16, b);
+      if (*q != b) throw std::invalid_argument("not a hex digit");
+
+      output.push_back(((p - lut) << 4) | (q - lut));
+    }
+  return output;
+}
+
+// AES encrypt/decrypt functions
+void aes_init()
+{
+  static int init=0;
+  if (init==0)
+    {
+      EVP_CIPHER_CTX e_ctx, d_ctx;
+                       
+      //initialize openssl ciphers
+      OpenSSL_add_all_ciphers();
+                                        
+      //initialize random number generator (for IVs)
+      int rv = RAND_load_file("/dev/urandom", 32);
+    }
+}
+                                                             
+std::vector<unsigned char> aes_256_gcm_encrypt(std::string plaintext, std::string key)
+{
+  aes_init();
+
+  size_t enc_length = plaintext.length()*3;
+  std::vector<unsigned char> output;
+  output.resize(enc_length,'\0');
+
+  unsigned char tag[AES_BLOCK_SIZE];
+  unsigned char iv[12];
+  RAND_bytes(iv, sizeof(iv));
+  std::copy( iv, iv+12, output.begin()+16);
+
+  int actual_size=0, final_size=0;
+  EVP_CIPHER_CTX* e_ctx = EVP_CIPHER_CTX_new();
+  //EVP_CIPHER_CTX_ctrl(e_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
+  EVP_EncryptInit(e_ctx, EVP_aes_256_gcm(), (const unsigned char*)key.c_str(), iv);
+  EVP_EncryptUpdate(e_ctx, &output[28], &actual_size, (const unsigned char*)plaintext.data(), plaintext.length() );
+  EVP_EncryptFinal(e_ctx, &output[28+actual_size], &final_size);
+  EVP_CIPHER_CTX_ctrl(e_ctx, EVP_CTRL_GCM_GET_TAG, 16, tag);
+  std::copy( tag, tag+16, output.begin() );
+  std::copy( iv, iv+12, output.begin()+16);
+  output.resize(28 + actual_size+final_size);
+  EVP_CIPHER_CTX_free(e_ctx);
+  return output;
+}
+
+std::string aes_256_gcm_decrypt(std::vector<unsigned char> ciphertext, std::string key)
+{
+  aes_init();
+
+  unsigned char tag[AES_BLOCK_SIZE];
+  unsigned char iv[12];
+  std::copy( ciphertext.begin(),    ciphertext.begin()+16, tag);
+  std::copy( ciphertext.begin()+16, ciphertext.begin()+28, iv);
+  std::vector<unsigned char> plaintext; plaintext.resize(ciphertext.size(), '\0');
+
+  int actual_size=0, final_size=0;
+  EVP_CIPHER_CTX *d_ctx = EVP_CIPHER_CTX_new();
+  EVP_DecryptInit(d_ctx, EVP_aes_256_gcm(), (const unsigned char*)key.c_str(), iv);
+  EVP_DecryptUpdate(d_ctx, &plaintext[0], &actual_size, &ciphertext[28], ciphertext.size()-28 );
+  EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
+  EVP_DecryptFinal(d_ctx, &plaintext[actual_size], &final_size);
+  EVP_CIPHER_CTX_free(d_ctx);
+  plaintext.resize(actual_size + final_size, '\0');
+
+  return string(plaintext.begin(),plaintext.end());
 }
 
 /* Function to get the IO Context */
@@ -780,8 +895,6 @@ void radosReadThread(ErasureCodeBench ecbench) {
 	bl.append(std::string(shard_size,(char)shard_index%26+97)); // start with 'a'
 #ifdef TRACE
 	output_lock.lock();
-	std::cerr THREAD_ID << "Created a Shard for encoding: "
-			    << info.name << std::endl;
 	std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
 	std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
 	std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
@@ -905,6 +1018,14 @@ void postReadThread() {
 	break;
       Shard a_shard = get_shard_and_erase(index);
       a_stripe.insert(std::pair<int, Shard>(i_shard,a_shard));
+#ifdef VERBOSITY_1
+      output_lock.lock();
+      std::cerr THREAD_ID << "Index: " << index << " buffer length is: "
+			  << a_shard.get_bufferlist_size()
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
     }
 
     if (!aio_done) {
@@ -942,6 +1063,8 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
   int stripe = 0;
   int buffers_created_count = 0;
   int object_set = 0;
+  utime_t begin_time = ceph_clock_now(g_ceph_context);
+  utime_t end_time = ceph_clock_now(g_ceph_context);
 
   if(!started) {
     started = true;
@@ -975,14 +1098,27 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
       object_set = stripe * shard_size / in_size;
       map<int,Shard> a_stripe;
       map<int,librados::bufferlist> encoded;
+      
+      if (is_encrypting) begin_time = ceph_clock_now(g_ceph_context);
       for (int i_shard=0;i_shard<stripe_size;i_shard++) {
+	librados::bufferlist bl = librados::bufferlist();
+	// We encrypt data here when encrypting is set
+	if (is_encrypting) {
+	  int local_size = shard_size - 28; // 12 bytes GHASH, 16 bytes IV
+	  string plaintext = std::string(local_size,(char)buffers_created_count++%26+97); 
+	  vector<unsigned char> ciphertext = aes_256_gcm_encrypt(plaintext, hex_to_string(aes_key));
+	  for (unsigned i=0; i< ciphertext.size();i++)
+	    bl.append(ciphertext[i]);
+	}
+	else {
+	  bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
+	}
+
 	// Create the data structure for the objects we will use
 	obj_index = object_set * stripe_size + i_shard;
 	obj_info info = get_obj_info(obj_index);
 
 	Shard data(stripe,i_shard,stripe_size,info.name);
-	librados::bufferlist bl = librados::bufferlist();
-	bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
 	data.set_bufferlist(bl);
 	a_stripe.insert( std::pair<int,Shard>(i_shard,data));
 #ifdef TRACE
@@ -997,10 +1133,18 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 	output_lock.unlock();
 #endif
       } 
+      if (is_encrypting) {
+	end_time = ceph_clock_now(g_ceph_context);
+	output_lock.lock();
+	cout << "encryption: " << (end_time - begin_time) << "\t" << ( (in_size / 1024)) << endl;
+	cout.flush();
+	output_lock.unlock();
+      }
 
 #ifdef TRACE
       output_lock.lock();
       std::cerr THREAD_ID << "Encoding a stripe" << std::endl;
+
       std::cerr.flush();
       output_lock.unlock();
 #endif
@@ -1097,14 +1241,48 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 	  encoded.insert(pair<int,librados::bufferlist>(K+m,bl));
 	}
 
-	ret = ecbench.encode(&encoded);
+	// Repair the stripe. 
 	// For now, we are just recreating the M parity shards, worst case. 
+	ret = ecbench.encode(&encoded);
 	if (ret < 0) {
 	  output_lock.lock();
 	  std::cerr THREAD_ID << "Error in erasure code call to ecbench. " << ret << std::endl;
 	  std::cerr.flush();
 	  output_lock.unlock();
 	} 
+
+	// Decrypt if we are useing encryption
+	if (is_encrypting) {
+	  utime_t begin_time = ceph_clock_now(g_ceph_context);
+	  int count = 0;
+	  for (count=0,encoded_it=encoded.begin();count<K;count++,encoded_it++) {
+	    librados::bufferlist bl = encoded_it->second;
+	    std::vector<unsigned char> enc;
+	    size_t enc_length = bl.length()*3;
+	    enc.resize(enc_length,'\0');
+	    int count = 0;
+	    for (auto it = bl.begin(); it != bl.end(); ++it, count++) {
+	      enc[count] = *it;
+	    }
+
+#ifdef TRACE
+	    output_lock.lock();
+	    std::cerr THREAD_ID << "encrypted buffer length: " << bl.length() << std::endl;
+	    std::cerr THREAD_ID << "encrypted c_str length: " << enc.size() << std::endl;
+	    std::cerr.flush();
+	    output_lock.unlock();
+#endif
+
+	    // vector<unsigned char> enc(blst.begin(),blst.end());
+	    string out = aes_256_gcm_decrypt(enc, hex_to_string(aes_key));
+	  }
+	  utime_t end_time = ceph_clock_now(g_ceph_context);
+	  output_lock.lock();
+	  cout << "decryption: " << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
+	  cout.flush();
+	  output_lock.unlock();
+
+	}
 
 #ifdef TRACE
 	output_lock.lock();
@@ -1116,6 +1294,7 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 	std::cerr.flush();
 	output_lock.unlock();
 #endif
+
 	encoded.clear();
 	/* Need to release the stripe memory. We are just measuring the time to repair
 	 * the stripe. Now we can release the resources*/
@@ -1194,6 +1373,10 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
      "run either encode or decode")
     ("erasures,e", po::value<int>()->default_value(1),
      "number of erasures when decoding")
+    ("encrypt,z", po::value<bool>()->default_value(false),
+     "Set to true to encrypt the data.")
+    ("aes_key,k", po::value<string>()->default_value("F19143000DC13512706DADB657029C2AFF3FFB1901FC0D667E2294C66A2FBC24"),
+     "AES-256 Encryption key, 32 bytes long, 256 bits.")
     ;
   std::cerr << "Added pool,plugin,workload,erasures" << std::endl;
   std::cerr.flush();
@@ -1281,6 +1464,8 @@ int ErasureCodeBench::setup(int argc, const char** argv) {
   plugin = vm["plugin"].as<string>();
   workload = vm["workload"].as<string>();
   erasures = vm["erasures"].as<int>();
+  is_encrypting = vm["encrypt"].as<bool>();
+  aes_key = vm["aes_key"].as<string>();
   if (vm.count("erasures-generation") > 0 &&
       vm["erasures-generation"].as<string>() == "exhaustive")
     exhaustive_erasures = true;
@@ -1547,6 +1732,7 @@ int main(int argc, const char** argv) {
     M = ecbench.m;
     v_erased = ecbench.erased;
     object_sets = (long long int)iterations * (long long int)shard_size / (long long int)in_size;
+    if (iterations % stripe_size != 0 ) object_sets++;
 
     std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
     std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
@@ -1558,6 +1744,9 @@ int main(int argc, const char** argv) {
     std::cout THREAD_ID << "M = " << M << std::endl;
     std::cout THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
     std::cout THREAD_ID << "Pool Name = " << pool_name << std::endl;
+    std::cout THREAD_ID << "workload = " << ecbench.workload << std::endl;
+    std::cout THREAD_ID << "is_encrypting = " << (is_encrypting ? "yes" : "no") << std::endl;
+    std::cout THREAD_ID << "encryption key = " << aes_key << std::endl;
 
     // store the program inputs in the global vars for access by threads
     _argc = argc;

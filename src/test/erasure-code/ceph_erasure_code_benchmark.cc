@@ -70,7 +70,7 @@
 #define STRIPE_QUEUE_FACTOR 2
 #define BLCTHREADS 10
 #define ENCTHREADS 10
-#define REPORT_SLEEP_DURATION 10000 // in milliseconds
+#define REPORT_SLEEP_DURATION 5000 // in milliseconds
 #define SHUTDOWN_SLEEP_DURATION 100 // in milliseconds
 #define THREAD_SLEEP_DURATION 1 // in milliseconds
 #define READ_SLEEP_DURATION 2 // in milliseconds
@@ -117,8 +117,8 @@ std::string aes_key; // AES-256 encryption key
 std::queue<int> stripes;
 std::queue<map<int,Shard>> data_stripes_queue, new_stripes_queue;
 list<librados::AioCompletion *> completions, finishing;
-std::queue<Shard> pending_buffers_queue, enc_queue;
-std::map<int,Shard> shards;
+std::queue<Shard> pending_buffers_queue, enc_queue, clear_shards_queue;
+std::map<int,Shard> shards, encrypted_shards_map;
 
 bool is_encrypting = false;
 bool g_is_encoding = false;
@@ -152,6 +152,8 @@ std::mutex cout_lock;
 std::mutex objs_lock;
 std::mutex enc_lock;
 std::mutex new_stripes_queue_lock;
+std::mutex clear_shards_queue_lock;
+std::mutex encrypted_shards_map_lock;
 
 // Object information. We stripe over these objects.
 struct obj_info {
@@ -175,7 +177,13 @@ std::map<int,CompletionOp *> pending_ops;
 // guarded queue accessor functions
 void print_message(std::string message) {
   std::lock_guard<std::mutex> guard(cout_lock);
-  std::cout << message << std::endl;
+  std::cerr << message;
+  std::cerr.flush();
+}
+
+void print_message_std(std::string message) {
+  std::lock_guard<std::mutex> guard(cout_lock);
+  std::cout << message;
   std::cout.flush();
 }
 
@@ -256,6 +264,39 @@ void insert_shard(int index,Shard shard) {
   return;
 }
 
+// encrypted shards map guarded accessors
+bool is_encrypted_shard_available(int index) {
+  std::lock_guard<std::mutex> guard(encrypted_shards_map_lock);
+  std::map<int, Shard>::iterator it = encrypted_shards_map.find(index);
+  bool status = true;
+  if (it == encrypted_shards_map.end()) 
+    status = false;
+  return status;
+}
+
+Shard get_encrypted_shard_and_erase(int index) {
+  std::lock_guard<std::mutex> guard(encrypted_shards_map_lock);
+  std::map<int, Shard>::iterator it = encrypted_shards_map.find(index);
+  Shard shard = it->second;
+  encrypted_shards_map.erase(it);
+  return shard;
+}
+
+int get_encrypted_shards_map_size() {
+  std::lock_guard<std::mutex> guard(encrypted_shards_map_lock);
+  return encrypted_shards_map.size();
+}
+
+bool is_encrypted_shards_map_empty() {
+  std::lock_guard<std::mutex> guard(encrypted_shards_map_lock);
+  return encrypted_shards_map.empty();
+}
+
+void insert_encrypted_shard(int index,Shard shard) {
+  std::lock_guard<std::mutex> guard(encrypted_shards_map_lock);
+  encrypted_shards_map.insert(pair<int,Shard>(index,shard));
+  return;
+}
 
 // Queue of integers representing stripes to be operated on 
 int get_stripes_queue_size() { 
@@ -341,6 +382,7 @@ int get_data_stripes_queue_size() {
   return data_stripes_queue.size();
 }
 
+// Pending buffers queue guarded accessors
 int get_pending_buffers_queue_size() {
   std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
   return pending_buffers_queue.size();
@@ -364,6 +406,42 @@ Shard pending_buffers_queue_pop() {
   return shard;
 }
 
+// Clear shards queue guarded accessors
+int get_clear_shards_queue_size() {
+  std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
+  return clear_shards_queue.size();
+}
+
+bool is_clear_shards_queue_empty() {
+  std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
+  return clear_shards_queue.empty();
+}
+
+void insert_clear_shard(Shard shard) {
+  std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
+  clear_shards_queue.push(shard);
+  return;
+}
+
+// This should be a single thread getting shards.
+Shard get_clear_shard(bool &status) {
+  std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
+  Shard shard(0,0,0,"placeholder");
+  if (!clear_shards_queue.empty()) {
+    status = true;
+    shard = clear_shards_queue.front();
+    clear_shards_queue.pop();
+#ifdef TRACE
+    std::stringstream ss;
+    ss THREAD_ID << "Got clear shard: " << shard.get_hash();
+    status ? ss << " status is true." : ss << " status is false.";
+    ss << std::endl;
+    print_message(ss.str());
+#endif
+  }
+  return shard;
+}
+
 // Encryption queue methods
 int get_enc_q_size() { 
   std::lock_guard<std::mutex> guard(enc_lock);
@@ -371,13 +449,11 @@ int get_enc_q_size() {
 }
 
 // TODO: a race might mean the queue is empty
-Shard get_enc_shard(bool status) {
+Shard get_enc_shard(bool &status) {
   std::lock_guard<std::mutex> guard(enc_lock);
-  status = true;
   Shard shard;
-  if (enc_queue.empty())
-    status = false;
-  else {
+  if (enc_queue.empty()) {
+    status = true;
     shard = enc_queue.front();
     enc_queue.pop();
   }
@@ -658,19 +734,20 @@ void reportThread()
 
   if(!started) {
     started = true;
-    output_lock.lock();
-    std::cout THREAD_ID << "Starting reportThread()" << std::endl;
-    std::cout.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting reportThread()" << std::endl;
+    print_message(ss.str());
   }
 
   while (!reporting_done)
     {
       std::this_thread::sleep_for(report_sleep_duration);
-      output_lock.lock();
-      std::cout THREAD_ID << "objs\tPendingO\tstripes\tNewStripes\tshards\tdecode\t"
-			  << "PendingQ" << "EncryptionQ" << std::endl;
-      std::cout THREAD_ID << get_objs_size() << "\t" 
+      std::stringstream ss;
+      ss << "    \tPend\tStripe\tNew   \t      \tData \t"
+			  << "Pend \tRead \tClear\tEnc  " << std::endl;
+      ss << "Objs\tOps \tQueue \tStripe\tshards\tQueue\t"
+			  << "Buff \tQueue\tQueue\tQueue" << std::endl;
+      ss << get_objs_size() << "\t" 
 			  << get_pending_ops_size() << "\t"
 			  << get_stripes_queue_size() << "\t"
 			  << get_new_stripes_queue_size() << "\t"
@@ -678,9 +755,10 @@ void reportThread()
 			  << get_data_stripes_queue_size() << "\t"
 			  << get_pending_buffers_queue_size() << "\t"
 			  << get_enc_q_size() << "\t"
+			  << get_clear_shards_queue_size() << "\t"
+			  << get_encrypted_shards_map_size() << "\t"
 			  << std::endl;
-      std::cout.flush();
-      output_lock.unlock();
+      print_message_std(ss.str());
     }
   return;
 }
@@ -709,25 +787,27 @@ void bootstrapThread()
    */
 
 #ifdef TRACE
-  output_lock.lock();
-  std::cerr THREAD_ID << "Started bootstrapThread()" << std::endl;
-  std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
-  std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
-  std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
-  std::cerr.flush();
-  output_lock.unlock();
+  {
+    std::stringstream ss;
+    ss THREAD_ID << "Started bootstrapThread()" << std::endl;
+    ss THREAD_ID << "iterations: " << iterations << std::endl;
+    ss THREAD_ID << "shard_size: " << shard_size << std::endl;
+    ss THREAD_ID << "in_size: " << in_size << std::endl;
+    print_message(ss.str());
+  }
 #endif
 
   int buf_len = 1;
   int index = 0;
 
 #ifdef TRACE
-  output_lock.lock();
-  std::cerr THREAD_ID << "object_sets: " << object_sets << std::endl;
-  std::cerr THREAD_ID << "Starting to init objects for writing..."
-		      << std::endl;
-  std::cerr.flush();
-  output_lock.unlock();
+  {
+    std::stringstream ss;
+    ss THREAD_ID << "object_sets: " << object_sets << std::endl;
+    ss THREAD_ID << "Starting to init objects for writing..."
+		 << std::endl;
+    print_message(ss.str());
+  }
 #endif
   for (int object_set = 0; object_set < object_sets; object_set++) {
     for (int shard = 0; shard < stripe_size; shard++) {
@@ -785,10 +865,9 @@ void radosWriteThread() {
   if(!started) {
     started = true;
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting radosWriteThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting radosWriteThread()" << std::endl;
+    print_message(ss.str());
 #endif
   }
 
@@ -910,10 +989,9 @@ void radosReadThread(ErasureCodeBench ecbench) {
   if(!started) {
     started = true;
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting radosReadThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting radosReadThread()" << std::endl;
+    print_message(ss.str());
 #endif
   }
 
@@ -1052,10 +1130,9 @@ void postReadThread() {
   if(!started) {
     started = true;
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting postReadThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting postReadThread()" << std::endl;
+    print_message(ss.str());
 #endif
   }
 
@@ -1123,10 +1200,94 @@ void postReadThread() {
   return; // Thread terminates
 }
 
-/* Function used to perform erasure encoding.
- */
+void preErasureEncodeThread() {
+  bool started = false;
+  int index = 0;
 
-// Stripe Creator and encryption Thread
+  if(!started) {
+    started = true;
+#ifdef TRACE
+    std::stringstream ss;
+    ss THREAD_ID << "Starting Preerasure Encoding Thread." << std::endl;
+    print_message(ss.str());
+#endif
+  }
+
+  /* In the preerasure encoding thread we assmeble stripes for erasure coding with
+   * Shards from the encrypted shards map. There are K+M Shards for each stripe in
+   * the shards map. The stripes are laid out in a single dimension so
+   * the first stripe has an index of 0..K-1..K+M-1 the second stripe has indices
+   * of K..2K-1..2K+M-1 etc.
+   */
+
+  for (int stripe = 0;stripe < iterations;stripe++) {
+    map<int, Shard> a_stripe;
+    for ( int i_shard = 0; i_shard < K;i_shard++) {
+      index = stripe * stripe_size + i_shard;
+      while (!aio_done && !is_encrypted_shard_available(index)) {
+#ifdef TRACE
+	std::stringstream ss;
+	ss THREAD_ID << " Getting: " << index << ", encrypted shards map size: "
+		     << get_encrypted_shards_map_size() << std::endl;
+	ss THREAD_ID << "i_shard: " << i_shard << std::endl;
+	ss THREAD_ID << "stripe_size: " << stripe_size << std::endl;
+	ss THREAD_ID << "stripe: " << stripe << std::endl;
+	print_message(ss.str());
+#endif
+	std::this_thread::sleep_for(read_sleep_duration);
+      }
+      Shard a_shard = get_encrypted_shard_and_erase(index);
+      a_stripe.insert(std::pair<int, Shard>(i_shard,a_shard));
+#ifdef VERBOSITY_1
+      output_lock.lock();
+      std::cerr THREAD_ID << "Index: " << index << " buffer length is: "
+			  << a_shard.get_bufferlist_size()
+			  << std::endl;
+      std::cerr.flush();
+      output_lock.unlock();
+#endif
+    }
+
+    // Add the M shards for the coding
+    int obj_index = 0;
+    int object_set = stripe * shard_size / in_size;
+    for (int i_shard = K; i_shard < M; i_shard++) {
+      librados::bufferlist bl = librados::bufferlist();
+      bl.append(std::string(shard_size,(char)20)); // fill with space
+      // Get the data structure for the objects we will use
+      obj_index = object_set * stripe_size + i_shard;
+      obj_info info = get_obj_info(obj_index);
+
+      Shard a_shard(stripe,i_shard,stripe_size,info.name);
+      a_shard.set_bufferlist(bl);
+      a_stripe.insert(std::pair<int, Shard>(i_shard,a_shard));
+    }
+
+    if (!aio_done) {
+      // Limit the number of stripes waiting for decode to a reasonable number
+      while (get_data_stripes_queue_size() > MAX_DECODE_QUEUE_SIZE) {
+	std::this_thread::sleep_for(read_sleep_duration);
+      }
+
+      insert_data_stripe(a_stripe);
+#ifdef VERBOSITY_1
+      std::stringstream ss;
+      ss THREAD_ID << " in preerasure encoding thread, done making a stripe." 
+			  << std::endl;
+      print_message(ss.str());
+#endif
+    }
+  }
+#ifdef TRACE
+  std::stringstream ss;
+  ss THREAD_ID << "Preerasure encoding thread exiting now." << std::endl;
+  print_message(ss.str());
+#endif
+
+  return; // Thread terminates
+}
+
+// Stripe Creator thread
 void stripeCreatorThread() {
   bool started = false;
   int stripe = 0;
@@ -1138,50 +1299,39 @@ void stripeCreatorThread() {
   if(!started) {
     started = true;
 #ifdef TRACE
-    {
       std::stringstream ss;
-      ss THREAD_ID << "Starting encryption Thread." << std::endl;
+      ss THREAD_ID << "Starting stripe creator Thread." << std::endl;
+      ss THREAD_ID << "iterations: " << iterations << std::endl;
+      ss THREAD_ID << "shard_size: " << shard_size << std::endl;
+      ss THREAD_ID << "in_size: " << in_size << std::endl;
+      ss THREAD_ID << "object_sets: " << object_sets << std::endl;
       print_message(ss.str());
+#endif
+  }
+  while (!is_stripes_queue_empty()) {
+    if ((stripe = get_stripes()) < 0) {
+      /* When the stripes queue is empty, we have submitted all of the
+       * work to be done. If by chance another thread grabbed the last
+       * work item from the stripes queue, then this test will exit now.
+       */
+      break;
     }
-#endif
-  }
-    while (!is_stripes_queue_empty()) {
-      if ((stripe = get_stripes()) < 0) {
-	/* When the stripes queue is empty, we have submitted all of the
-	 * work to be done. If by chance another thread grabbed the last
-	 * work item from the stripes queue, then this test will exit now.
-	 */
-	break;
-      }
 
-#ifdef TRACE
-      {
-        std::stringstream ss;
-	ss THREAD_ID << "iterations: " << iterations << std::endl;
-	ss THREAD_ID << "shard_size: " << shard_size << std::endl;
-	ss THREAD_ID << "in_size: " << in_size << std::endl;
-	ss THREAD_ID << "object_sets: " << object_sets << std::endl;
-	print_message(ss.str());
-  }
-#endif
-      int obj_index = 0;
-      object_set = stripe * shard_size / in_size;
-      map<int,Shard> a_stripe;
+    int obj_index = 0;
+    object_set = stripe * shard_size / in_size;
 
-      if (is_encrypting) begin_time = ceph_clock_now(g_ceph_context);
-      for (int i_shard=0;i_shard<stripe_size;i_shard++) {
+    /* If we are encrypting the data, we insert the shards into the clear queue. The stripes
+     * are made in the preErasureEncodingThread. If we are not encrypting, then the stripes
+     * are ready to put into the erasureEncodingThread via the data_stripe_queue. The 
+     * salt and GHASH take 28 bytes so the buffers for encryption must be shortened by
+     * that amount.
+     */
+    if (is_encrypting) {
+	int local_size = shard_size - 28; // 12 bytes GHASH, 16 bytes IV
+
+      for (int i_shard=0;i_shard<K;i_shard++) {
 	librados::bufferlist bl = librados::bufferlist();
-	// We encrypt data here when encrypting is set
-	if (is_encrypting) {
-	  int local_size = shard_size - 28; // 12 bytes GHASH, 16 bytes IV
-	  string plaintext = std::string(local_size,(char)buffers_created_count++%26+97); 
-	  vector<unsigned char> ciphertext = aes_256_gcm_encrypt(plaintext, hex_to_string(aes_key));
-	  for (unsigned i=0; i< ciphertext.size();i++)
-	    bl.append(ciphertext[i]);
-	}
-	else {
-	  bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
-	}
+	bl.append(std::string(local_size,(char)buffers_created_count++%26+97)); // start with 'a'
 
 	// Get the data structure for the objects we will use
 	obj_index = object_set * stripe_size + i_shard;
@@ -1189,24 +1339,51 @@ void stripeCreatorThread() {
 
 	Shard data(stripe,i_shard,stripe_size,info.name);
 	data.set_bufferlist(bl);
-	a_stripe.insert( std::pair<int,Shard>(i_shard,data));
+	insert_clear_shard(data);
+#ifdef TRACE
+	std::stringstream ss;
+	ss THREAD_ID << "Inserted clear shard: " << data.get_hash() << std::endl;
+	print_message(ss.str());
+#endif
+      }
+    }
+    else {
+      map<int,Shard> a_stripe;
+      for (int i_shard=0;i_shard<K;i_shard++) {
+	librados::bufferlist bl = librados::bufferlist();
+	bl.append(std::string(shard_size,(char)buffers_created_count++%26+97)); // start with 'a'
+
+	// Get the data structure for the objects we will use
+	obj_index = object_set * stripe_size + i_shard;
+	obj_info info = get_obj_info(obj_index);
+
+	Shard a_shard(stripe,i_shard,stripe_size,info.name);
+	a_shard.set_bufferlist(bl);
+	a_stripe.insert( std::pair<int,Shard>(i_shard,a_shard));
 
       } // stripe created.
-      if (is_encrypting) {
-	end_time = ceph_clock_now(g_ceph_context);
-	output_lock.lock();
-	cout << "encryption: " << (end_time - begin_time) << "\t" << ( (in_size / 1024)) << endl;
-	cout.flush();
-	output_lock.unlock();
+      // Add the M shards for the coding
+      int obj_index = 0;
+      int object_set = stripe * shard_size / in_size;
+      for (int i_shard = K; i_shard < M; i_shard++) {
+	librados::bufferlist bl = librados::bufferlist();
+	bl.append(std::string(shard_size,(char)20)); // fill with space
+	// Get the data structure for the objects we will use
+	obj_index = object_set * stripe_size + i_shard;
+	obj_info info = get_obj_info(obj_index);
+
+	Shard a_shard(stripe,i_shard,stripe_size,info.name);
+	a_shard.set_bufferlist(bl);
+	a_stripe.insert(std::pair<int, Shard>(i_shard,a_shard));
       }
       insert_data_stripe(a_stripe);
+    }
   }
 
 #ifdef TRACE
-  output_lock.lock();
-  std::cerr THREAD_ID << "Stripe Creator Thread exiting now." << std::endl;
-  std::cerr.flush();
-  output_lock.unlock();
+  std::stringstream ss;
+  ss THREAD_ID << "Stripe Creator Thread exiting now." << std::endl;
+  print_message(ss.str());
 #endif
 
   return; // Thread terminates
@@ -1222,10 +1399,9 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
   if(!started) {
     started = true;
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting erasureEncodeThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting erasureEncodeThread()" << std::endl;
+    print_message(ss.str());
 #endif
   }
   while (!ec_done) {
@@ -1314,10 +1490,9 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
   if(!started) {
     started = true;
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "Starting erasureDecodeThread()" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "Starting erasureDecodeThread()" << std::endl;
+    print_message(ss.str());
 #endif
   }
   while (!ec_done) {
@@ -1352,7 +1527,7 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 	encoded.clear();
 	/* Need to release the stripe memory. We are just measuring the time to repair
 	 * the stripe. Now we can release the resources. If we are decrypting, we
-	 * push the stripes in the enc_queue for the decryption thread.
+	 * push the shards in the enc_queue for the decryption thread.
 	 */
 	for (stripe_it=stripe.begin();
 	     stripe_it!=stripe.end();stripe_it++) {
@@ -1397,33 +1572,91 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
   return; // Thread terminates
 }
 
+// encrypt shards Thread
+void encryptionThread() {
+  bool started = false;
+
+  if(!started) {
+    started = true;
+    std::stringstream ss;
+    ss THREAD_ID << "Starting encryptionThread()" << std::endl;
+    print_message(ss.str());
+  }
+
+  while (!enc_done) {
+    // encrypt if we are useing 
+    Shard shard;
+    bool status = false;
+    shard = get_clear_shard(status);
+#ifdef TRACE
+    {
+      std::stringstream ss;
+      ss THREAD_ID << "clear queue length: " << get_clear_shards_queue_size();
+      status ? ss << " status is true." : ss << " status is false.";
+      ss  << std::endl;
+      print_message(ss.str());
+    }
+#endif
+    if (status == true) {
+#ifdef TRACE
+      utime_t begin_time = ceph_clock_now(g_ceph_context);
+#endif
+      librados::bufferlist bl = shard.get_bufferlist();
+      vector<unsigned char> ciphertext = aes_256_gcm_encrypt(bl.c_str(), hex_to_string(aes_key));
+      bl.clear();
+      for (unsigned i=0; i< ciphertext.size();i++)
+	bl.append(ciphertext[i]);
+      shard.set_bufferlist(bl);
+      insert_encrypted_shard(shard.get_hash(),shard);
+#ifdef TRACE
+      std::stringstream ss;
+      ss THREAD_ID << "clear queue length: " << get_clear_shards_queue_size() << std::endl;
+      ss THREAD_ID << "clear text length: " << bl.length() << std::endl;
+      ss THREAD_ID << "cipher text length: " << ciphertext.size() << std::endl;
+      utime_t end_time = ceph_clock_now(g_ceph_context);
+      ss << "encryption: " << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
+      print_message(ss.str());
+#endif
+    }
+    else {
+      std::stringstream ss;
+      ss THREAD_ID << "No clear shard. ";
+      ss << std::endl;
+      print_message(ss.str());
+
+      std::this_thread::sleep_for(read_sleep_duration);
+    }
+  } // while (!is_enc_q_empty)
+#ifdef TRACE
+  std::stringstream ss;
+  ss THREAD_ID << "encryptionThread exiting now." << std::endl;
+  print_message(ss.str());
+#endif
+
+  return; // Thread terminates
+}
+
 // Decrypt Thread
 void decryptionThread() {
   bool started = false;
-  bool got_shard = false;
-  Shard shard;
 
   if(!started) {
     started = true;
     std::stringstream ss;
     ss THREAD_ID << "Starting decryptionThread()" << std::endl;
     print_message(ss.str());
-    /*#ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Starting decryptionThread()" << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
-      #endif */
   }
 
   while (!enc_done) {
     // Decrypt if we are useing 
+    bool status = false;
+    Shard shard;
     if (!is_enc_q_empty()) {
 #ifdef TRACE
       utime_t begin_time = ceph_clock_now(g_ceph_context);
 #endif
-      Shard shard = get_enc_shard(got_shard);
-      if (got_shard) {
+      Shard shard = get_enc_shard(status);
+      if (status) {
 	librados::bufferlist bl = shard.get_bufferlist();
 	std::vector<unsigned char> enc;
 	size_t enc_length = bl.length();
@@ -1434,21 +1667,29 @@ void decryptionThread() {
 
 	string out = aes_256_gcm_decrypt(enc, hex_to_string(aes_key));
 #ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "encryption queue length: " << get_enc_q_size() << std::endl;
-	std::cerr THREAD_ID << "encrypted buffer length: " << bl.length() << std::endl;
-	std::cerr THREAD_ID << "encrypted c_str length: " << enc.size() << std::endl;
-	std::cerr THREAD_ID << "decrypted string length: " << out.size() << std::endl;
-	utime_t end_time = ceph_clock_now(g_ceph_context);
-	std::cerr << "decryption: " << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
-	std::cerr.flush();
-	output_lock.unlock();
+	{
+	  std::stringstream ss;
+	  ss THREAD_ID << "encryption queue length: " << get_enc_q_size() << std::endl;
+	  ss THREAD_ID << "encrypted buffer length: " << bl.length() << std::endl;
+	  ss THREAD_ID << "encrypted c_str length: " << enc.size() << std::endl;
+	  ss THREAD_ID << "decrypted string length: " << out.size() << std::endl;
+	  utime_t end_time = ceph_clock_now(g_ceph_context);
+	  ss << "decryption: " << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
+	  print_message(ss.str());
+	}
 #endif
       }
     }
     else 
       std::this_thread::sleep_for(read_sleep_duration);
   } // while (!is_enc_q_empty)
+#ifdef TRACE
+  std::stringstream ss;
+  ss THREAD_ID << "decryptionThread exiting now." << std::endl;
+  print_message(ss.str());
+#endif
+
+  return; // Thread terminates
 }
 
 /* @writing_done means that the rados has finished writing shards/objects.
@@ -1839,6 +2080,7 @@ int main(int argc, const char** argv) {
   std::thread prThread;
   std::thread decryptThread;
   std::thread scThread;
+  std::thread preECThread;
 
   // variables used for timing
   utime_t end_time;
@@ -1870,19 +2112,25 @@ int main(int argc, const char** argv) {
     object_sets = (long long int)iterations * (long long int)shard_size / (long long int)in_size;
     if (iterations % stripe_size != 0 ) object_sets++;
 
-    std::cout THREAD_ID << "Iterations = " << iterations << std::endl;
-    std::cout THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
-    std::cout THREAD_ID << "Queue Size = " << queue_size << std::endl;
-    std::cout THREAD_ID << "Object Size = " << in_size << std::endl;
-    std::cout THREAD_ID << "Shard Size = " << shard_size << std::endl;
-    std::cout THREAD_ID << "Object Sets = " << object_sets << std::endl;
-    std::cout THREAD_ID << "K = " << K << std::endl;
-    std::cout THREAD_ID << "M = " << M << std::endl;
-    std::cout THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
-    std::cout THREAD_ID << "Pool Name = " << pool_name << std::endl;
-    std::cout THREAD_ID << "workload = " << ecbench.workload << std::endl;
-    std::cout THREAD_ID << "is_encrypting = " << (is_encrypting ? "yes" : "no") << std::endl;
-    std::cout THREAD_ID << "encryption key = " << aes_key << std::endl;
+    {
+      std::stringstream ss;
+      ss THREAD_ID << "Iterations = " << iterations << std::endl;
+      ss THREAD_ID << "Stripe Size = " << stripe_size << std::endl;
+      ss THREAD_ID << "Queue Size = " << queue_size << std::endl;
+      ss THREAD_ID << "Object Size = " << in_size << std::endl;
+      ss THREAD_ID << "Shard Size = " << shard_size << std::endl;
+      ss THREAD_ID << "Object Sets = " << object_sets << std::endl;
+      ss THREAD_ID << "K = " << K << std::endl;
+      ss THREAD_ID << "M = " << M << std::endl;
+      ss THREAD_ID << "Object Name Prefix = " << obj_name << std::endl;
+      ss THREAD_ID << "Pool Name = " << pool_name << std::endl;
+      ss THREAD_ID << "workload = " << ecbench.workload << std::endl;
+      if (is_encrypting) {
+	ss THREAD_ID << "is_encrypting = " << (is_encrypting ? "yes" : "no") << std::endl;
+	ss THREAD_ID << "encryption key = " << aes_key << std::endl;
+      }
+      print_message_std(ss.str());
+    }
 
     // store the program inputs in the global vars for access by threads
     _argc = argc;
@@ -1909,6 +2157,12 @@ int main(int argc, const char** argv) {
 	std::this_thread::sleep_for(thread_sleep_duration);
       // Create stripes and encrypt if required
       scThread = std::thread (stripeCreatorThread);
+      if (is_encrypting) {
+	for (int i = 0;i<enc_threads;i++) 
+	  v_enc_threads.push_back(std::thread (encryptionThread));
+	preECThread = std::thread (preErasureEncodeThread);
+      }
+
       // Start the erasureEncodeThread. Only do one thread with Gibraltar
       for (int i = 0;i<ec_threads;i++) {
 	v_ec_threads.push_back(std::thread (erasureEncodeThread, ecbench));
@@ -1975,11 +2229,49 @@ int main(int argc, const char** argv) {
       scThread.join(); // This needs to finish before we start writing.
 
       while (!ec_done) {
-	if (is_new_stripes_queue_empty())
+	if (is_data_stripes_queue_empty())
 	  ec_done = true;
 	else
 	  std::this_thread::sleep_for(shutdown_sleep_duration);
       }
+#ifdef TRACE
+      {
+	std::stringstream ss;
+	ss << "Shutdown: New Stripes Queue is Empty." << std::endl;
+	ss << "Shutdown: Encrypt Queue Size is: " << get_enc_q_size() << std::endl;
+	print_message(ss.str());
+      }
+#endif
+
+
+      if (is_encrypting) {
+	while (!enc_done) {
+	  if (is_encrypted_shards_map_empty())
+	    enc_done = true;
+	  else {
+#ifdef VERBOSITY_1
+	    {
+	      std::stringstream ss;
+	      ss << "Shutdown: Encrypt Queue Size is: " << get_enc_q_size() << std::endl;
+	      print_message(ss.str());
+	    }
+#endif
+	    std::this_thread::sleep_for(report_sleep_duration);
+	  }
+	  std::vector<std::thread>::iterator encit;
+	  for (encit=v_enc_threads.begin();encit!=v_enc_threads.end();encit++)
+	    encit->join();  // Wait for the decryptionThread to finish.
+#ifdef TRACE
+	  {
+	    std::stringstream ss;
+	    ss THREAD_ID << "Shutdown: Done encryption." << std::endl;
+	    print_message(ss.str());
+	  }
+#endif
+	  preECThread.join();
+	}
+      }
+
       std::vector<std::thread>::iterator ecit;
       for (ecit=v_ec_threads.begin();ecit!=v_ec_threads.end();ecit++)
 	ecit->join();  // Wait for the ecThread to finish.

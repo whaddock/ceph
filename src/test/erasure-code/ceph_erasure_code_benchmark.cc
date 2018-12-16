@@ -58,8 +58,8 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define TRACE 
-#define VERBOSITY_1 */
+//#define TRACE 
+//#define VERBOSITY_1 */
 #define RADOS_THREADS 1
 
 #ifndef EC_THREADS
@@ -69,7 +69,7 @@
 #define COMPLETION_WAIT_COUNT 500
 #define STRIPE_QUEUE_FACTOR 2
 #define BLCTHREADS 10
-#define ENCTHREADS 10
+#define ENCTHREADS 1
 #define REPORT_SLEEP_DURATION 5000 // in milliseconds
 #define SHUTDOWN_SLEEP_DURATION 100 // in milliseconds
 #define THREAD_SLEEP_DURATION 1 // in milliseconds
@@ -114,10 +114,10 @@ librados::IoCtx io_ctx;
 std::string aes_key; // AES-256 encryption key
 
 // Create queues, maps and iterators used by the main and thread functions.
-std::queue<int> stripes;
-std::queue<map<int,Shard>> data_stripes_queue, new_stripes_queue;
+std::deque<int> stripes;
+std::deque<map<int,Shard>> data_stripes_queue, new_stripes_queue;
 list<librados::AioCompletion *> completions, finishing;
-std::queue<Shard> pending_buffers_queue, enc_queue, clear_shards_queue;
+std::deque<Shard> pending_buffers_queue, enc_queue, clear_shards_queue;
 std::map<int,Shard> shards, encrypted_shards_map;
 
 bool is_encrypting = false;
@@ -148,7 +148,7 @@ std::mutex shards_lock;
 std::mutex pending_buffers_queue_lock;
 std::mutex write_buffers_waiting_lock;
 std::mutex pending_ops_lock;
-std::mutex cout_lock;
+std::mutex cout_lock, cerr_lock;
 std::mutex objs_lock;
 std::mutex enc_lock;
 std::mutex new_stripes_queue_lock;
@@ -176,7 +176,7 @@ std::map<int,CompletionOp *> pending_ops;
 
 // guarded queue accessor functions
 void print_message(const std::string message) {
-  std::lock_guard<std::mutex> guard(cout_lock);
+  std::lock_guard<std::mutex> guard(cerr_lock);
   std::cerr << message;
   std::cerr.flush();
 }
@@ -309,7 +309,7 @@ int get_stripes() {
   std::lock_guard<std::mutex> guard(stripes_lock);
   if (!stripes.empty()) {
     stripe = stripes.front();
-    stripes.pop();
+    stripes.pop_front();
   }
   else 
     stripe = INT_MIN;
@@ -335,14 +335,14 @@ std::map<int,Shard> get_new_stripe(bool &status) {
     status = false;
   else {
     stripe = new_stripes_queue.front();
-    new_stripes_queue.pop();
+    new_stripes_queue.pop_front();
   }
   return stripe;
 }
 
 void insert_new_stripe(map<int,Shard> stripe) {
   std::lock_guard<std::mutex> guard(new_stripes_queue_lock);
-  new_stripes_queue.push(stripe);
+  new_stripes_queue.push_back(stripe);
   return;
 }
 
@@ -365,14 +365,14 @@ std::map<int,Shard> get_data_stripe(bool &status) {
     status = false;
   else {
     stripe = data_stripes_queue.front();
-    data_stripes_queue.pop();
+    data_stripes_queue.pop_front();
   }
   return stripe;
 }
 
 void insert_data_stripe(map<int,Shard> stripe) {
   std::lock_guard<std::mutex> guard(data_stripes_queue_lock);
-  data_stripes_queue.push(stripe);
+  data_stripes_queue.push_back(stripe);
   return;
 }
 
@@ -395,14 +395,14 @@ bool is_pending_buffers_queue_empty() {
 
 void pending_buffers_queue_push(Shard shard) {
   std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
-  pending_buffers_queue.push(shard);
+  pending_buffers_queue.push_back(shard);
   return;
 }
 
 Shard pending_buffers_queue_pop() {
   std::lock_guard<std::mutex> guard(pending_buffers_queue_lock);
   Shard shard = pending_buffers_queue.front();
-  pending_buffers_queue.pop();
+  pending_buffers_queue.pop_front();
   return shard;
 }
 
@@ -419,40 +419,40 @@ bool is_clear_shards_queue_empty() {
 
 void insert_clear_shard(Shard shard) {
   std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
-  clear_shards_queue.push(shard);
+  clear_shards_queue.push_back(shard);
   return;
 }
 
-Shard get_clear_shard(bool &status) {
+void get_clear_shard(Shard &shard, bool &status) {
   std::lock_guard<std::mutex> guard(clear_shards_queue_lock);
-  Shard shard(0,0,0,"placeholder");
 #ifdef TRACE
+  {
     std::stringstream ss;
     ss THREAD_ID << "Getting a clear shard ..." << std::endl;
     ss THREAD_ID << "clear shard queue size is: " << clear_shards_queue.size();
     ss << std::endl;
     print_message(ss.str());
+  }
 #endif
-    try {
-      if (!clear_shards_queue.empty()) {
-	status = true;
-	shard = clear_shards_queue.front();
-	clear_shards_queue.pop();
+  try {
+    if (!clear_shards_queue.empty()) {
+      status = true;
+      shard = clear_shards_queue.front();
+      clear_shards_queue.pop_front();
 #ifdef TRACE
-	std::stringstream ss;
-	ss THREAD_ID << "Got clear shard: " << shard.get_hash();
-	status ? ss << " status is true." : ss << " status is false.";
-	ss << std::endl;
-	print_message(ss.str());
-#endif
-      }
-    }
-    catch (std::exception e) {
       std::stringstream ss;
-      ss THREAD_ID << "Got an exception in get_clear_shard. " << e.what() << std::endl;
+      ss THREAD_ID << "Got clear shard: " << shard.get_hash();
+      status ? ss << " status is true." : ss << " status is false.";
+      ss << std::endl;
       print_message(ss.str());
+#endif
     }
-  return shard;
+  }
+  catch (std::exception e) {
+    std::stringstream ss;
+    ss THREAD_ID << "Got an exception in get_clear_shard. " << e.what() << std::endl;
+    print_message(ss.str());
+  }
 }
 
 // Encryption queue methods
@@ -468,14 +468,14 @@ Shard get_enc_shard(bool &status) {
   if (enc_queue.empty()) {
     status = true;
     shard = enc_queue.front();
-    enc_queue.pop();
+    enc_queue.pop_front();
   }
   return shard;
 }
 
 void insert_enc_shard(Shard shard) {
   std::lock_guard<std::mutex> guard(enc_lock);
-  enc_queue.push(shard);
+  enc_queue.push_back(shard);
   return;
 }
 
@@ -585,7 +585,7 @@ std::vector<unsigned char> aes_256_gcm_encrypt(std::string plaintext, std::strin
 {
   aes_init();
 
-  size_t enc_length = plaintext.length()*3;
+  size_t enc_length = plaintext.length()+256;
   std::vector<unsigned char> output;
   output.resize(enc_length,'\0');
 
@@ -637,18 +637,18 @@ void initRadosIO() {
   ret = rados.init("admin"); // just use the client.admin keyring
   if (ret < 0) { // let's handle any error that might have come back
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    {
+      std::stringstream ss;
+      ss THREAD_ID << "couldn't initialize rados! error " << ret << std::endl;
+      print_message(ss.str());
+    }
 #endif
     ret = EXIT_FAILURE;
   } else {
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID << "we just set up a rados cluster object" << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    std::stringstream ss;
+    ss THREAD_ID << "we just set up a rados cluster object" << std::endl;
+    print_message(ss.str());
 #endif
   }
 
@@ -662,18 +662,18 @@ void initRadosIO() {
     if (ret < 0) {
       // This really can't happen, but we need to check to be a good citizen.
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "failed to parse config options! error " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      std::stringstream ss;
+      ss THREAD_ID << "failed to parse config options! error " << ret << std::endl;
+      print_message(ss.str());
 #endif
       ret = EXIT_FAILURE;
     } else {
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "we just parsed our config options" << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      {
+	std::stringstream ss;
+	ss THREAD_ID << "we just parsed our config options" << std::endl;
+	print_message(ss.str());
+      }
 #endif
       // We also want to apply the config file if the user specified
       // one, and conf_parse_argv won't do that for us.
@@ -683,11 +683,10 @@ void initRadosIO() {
 	  if (ret < 0) {
 	    // This could fail if the config file is malformed, but it'd be hard.
 #ifdef TRACE
-	    output_lock.lock();
-	    std::cerr THREAD_ID << "failed to parse config file " << _argv[i+1]
+	    std::stringstream ss;
+	    ss THREAD_ID << "failed to parse config file " << _argv[i+1]
 				<< "! error" << ret << std::endl;
-	    std::cerr.flush();
-	    output_lock.unlock();
+	    print_message(ss.str());
 #endif
 	    ret = EXIT_FAILURE;
 	  }
@@ -704,18 +703,16 @@ void initRadosIO() {
     ret = rados.connect();
     if (ret < 0) {
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      std::stringstream ss;
+      ss THREAD_ID << "couldn't connect to cluster! error " << ret << std::endl;
+      print_message(ss.str());
 #endif
       ret = EXIT_FAILURE;
     } else {
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "we just connected to the rados cluster" << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      std::stringstream ss;
+      ss THREAD_ID << "we just connected to the rados cluster" << std::endl;
+      print_message(ss.str());
 #endif
     }
   }
@@ -727,10 +724,9 @@ void initRadosIO() {
     ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
     if (ret < 0) {
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      std::stringstream ss;
+      ss THREAD_ID << "couldn't set up ioctx! error " << ret << std::endl;
+      print_message(ss.str());
 #endif
       ret = EXIT_FAILURE;
     } 
@@ -833,12 +829,13 @@ void bootstrapThread() {
       index = object_set * stripe_size + shard;
       insert_objs(index,info);
 #ifdef TRACE
-      output_lock.lock();
-      std::cerr THREAD_ID << "Creating object: " << info.name
-			  << std::endl;
-      std::cerr THREAD_ID << "index:: " << index << std::endl;
-      std::cerr.flush();
-      output_lock.unlock();
+      {
+	std::stringstream ss;
+	ss THREAD_ID << "Creating object: " << info.name
+		     << std::endl;
+	ss THREAD_ID << "index:: " << index << std::endl;
+	print_message(ss.str());
+      }
 #endif
       bufferptr p = buffer::create(buf_len);
       bufferlist bl;
@@ -858,10 +855,9 @@ void bootstrapThread() {
     }
   }
 #ifdef TRACE
-  output_lock.lock();
-  std::cerr THREAD_ID << "Finished bootstrapThread(), exiting." << std::endl;
-  std::cerr.flush();
-  output_lock.unlock();
+  std::stringstream ss;
+  ss THREAD_ID << "Finished bootstrapThread(), exiting." << std::endl;
+  print_message(ss.str());
 #endif
 }
 
@@ -1016,10 +1012,11 @@ void radosReadThread(ErasureCodeBench ecbench) {
   while (!reading_done) {
     // wait for the request to complete, and check that it succeeded.
 #ifdef TRACE
-    output_lock.lock();
-    std::cerr THREAD_ID  << "In radosReadThread() outer while loop." << std::endl;
-    std::cerr.flush();
-    output_lock.unlock();
+    {
+      std::stringstream ss;
+      ss THREAD_ID  << "In radosReadThread() outer while loop." << std::endl;
+      print_message(ss.str());
+    }
 #endif
 
     while (!is_stripes_queue_empty()) {
@@ -1056,16 +1053,17 @@ void radosReadThread(ErasureCodeBench ecbench) {
 	// We create the buffer with data that will be overwritten.
 	bl.append(std::string(shard_size,(char)shard_index%26+97)); // start with 'a'
 #ifdef TRACE
-	output_lock.lock();
-	std::cerr THREAD_ID << "iterations: " << iterations << std::endl;
-	std::cerr THREAD_ID << "shard_size: " << shard_size << std::endl;
-	std::cerr THREAD_ID << "in_size: " << in_size << std::endl;
-	std::cerr THREAD_ID << "shard: " << i_shard << std::endl;
-	std::cerr THREAD_ID << "stripe: " << stripe << std::endl;
-	std::cerr THREAD_ID << "offset: " << offset << std::endl;
-	std::cerr THREAD_ID << "object_set: " << object_set << std::endl;
-	std::cerr.flush();
-	output_lock.unlock();
+	{
+	  std::stringstream ss;
+	  ss THREAD_ID << "iterations: " << iterations << std::endl;
+	  ss THREAD_ID << "shard_size: " << shard_size << std::endl;
+	  ss THREAD_ID << "in_size: " << in_size << std::endl;
+	  ss THREAD_ID << "shard: " << i_shard << std::endl;
+	  ss THREAD_ID << "stripe: " << stripe << std::endl;
+	  ss THREAD_ID << "offset: " << offset << std::endl;
+	  ss THREAD_ID << "object_set: " << object_set << std::endl;
+	  print_message(ss.str());
+	}
 #endif
 
 	CompletionOp *op = new CompletionOp(info.name);
@@ -1334,7 +1332,7 @@ void stripeCreatorThread() {
      * that amount.
      */
     if (is_encrypting) {
-	int local_size = shard_size - 28; // 12 bytes GHASH, 16 bytes IV
+      int local_size = shard_size - 28; // 12 bytes GHASH, 16 bytes IV
 
       for (int i_shard=0;i_shard<K;i_shard++) {
 	librados::bufferlist bl = librados::bufferlist();
@@ -1592,7 +1590,7 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 	ss THREAD_ID << "Stripe " <<  stripe.begin()->second.get_stripe() 
 			    << " decoded in erasureDecodeThread()" << std::endl;
 	ss THREAD_ID << "Decoding done, buffers discarded, in erasureDecodeThread()."
-			    << std::endl;
+		     << std::endl;
 	ss THREAD_ID << "stripes_decode_size: " << get_data_stripes_queue_size() << std::endl;
 	ss THREAD_ID << "encryption queue size size: " << get_enc_q_size() << std::endl;
 	print_message(ss.str());
@@ -1616,6 +1614,7 @@ void erasureDecodeThread(ErasureCodeBench ecbench) {
 // encrypt shards Thread
 void encryptionThread() {
   bool started = false;
+  Shard shard;
 
   if(!started) {
     started = true;
@@ -1627,39 +1626,42 @@ void encryptionThread() {
   while (!enc_done) {
     // encrypt if we are useing 
     bool status = false;
-    Shard shard = get_clear_shard(status);
+    get_clear_shard(shard,status);
 #ifdef TRACE
     {
       std::stringstream ss;
       ss THREAD_ID << "clear queue length: " << get_clear_shards_queue_size();
       status ? ss << " status is true." : ss << " status is false.";
       ss  << std::endl;
+      if (status)
+	ss THREAD_ID << "clear shard hash: [" << shard.get_hash() << "]" << std::endl;
       print_message(ss.str());
     }
 #endif
-    if (status == true) {
+    if (status) {
 #ifdef TRACE
       utime_t begin_time = ceph_clock_now(g_ceph_context);
 #endif
       librados::bufferlist bl = shard.get_bufferlist();
+      std::string cleartext(bl.c_str());
       vector<unsigned char> ciphertext;
       try {
-      ciphertext = aes_256_gcm_encrypt(bl.c_str(), hex_to_string(aes_key));
-      bl.clear();
-      for (unsigned i=0; i< ciphertext.size();i++)
-	bl.append(ciphertext[i]);
-      shard.set_bufferlist(bl);
+	ciphertext = aes_256_gcm_encrypt(cleartext, hex_to_string(aes_key));
+	bl.clear();
+	for (unsigned i=0; i< ciphertext.size();i++)
+	  bl.append(ciphertext[i]);
       }
       catch (std::exception e) {
 	std::stringstream ss;
 	ss THREAD_ID << "Encryption failure: " << e.what() << std::endl;
 	print_message(ss.str());
       }
+      shard.set_bufferlist(bl);
       insert_encrypted_shard(shard.get_hash(),shard);
 #ifdef TRACE
       std::stringstream ss;
       ss THREAD_ID << "clear queue length: " << get_clear_shards_queue_size() << std::endl;
-      ss THREAD_ID << "clear text length: " << bl.length() << std::endl;
+      ss THREAD_ID << "clear text length: " << cleartext.size() << std::endl;
       ss THREAD_ID << "cipher text length: " << ciphertext.size() << std::endl;
       utime_t end_time = ceph_clock_now(g_ceph_context);
       ss THREAD_ID << "encryption: " << (end_time - begin_time) << "\t" << ((in_size / 1024)) << endl;
@@ -2187,7 +2189,7 @@ int main(int argc, const char** argv) {
     // Initialize the stripes list
     // Single thread here, no locking required.
     for (int i = 0;i<iterations;i++)
-      stripes.push(i);
+      stripes.push_back(i);
  
     // Initialize rados
     initRadosIO();

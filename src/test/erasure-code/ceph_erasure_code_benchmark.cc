@@ -58,9 +58,6 @@
 #ifndef EC_THREADS
 #define EC_THREADS 10
 #endif
-#define MAX_DECODE_QUEUE_SIZE 3
-#define COMPLETION_WAIT_COUNT 500
-#define STRIPE_QUEUE_FACTOR 2
 #define BLCTHREADS 10
 #define REPORT_SLEEP_DURATION 10000 // in milliseconds
 #define SHUTDOWN_SLEEP_DURATION 100 // in milliseconds
@@ -909,7 +906,7 @@ void postReadThread() {
 
     if (!aio_done) {
       // Limit the number of stripes waiting for decode to a reasonable number
-      while (get_stripes_decode_queue_size() > MAX_DECODE_QUEUE_SIZE) {
+      while (get_stripes_decode_queue_size() > ec_threads + 2) {
 	std::this_thread::sleep_for(read_sleep_duration);
       }
 
@@ -1023,6 +1020,11 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 	output_lock.unlock();
       } 
 
+      // Throttle, don't use too many buffers.
+      while (get_pending_buffers_queue_size() > ecbench.queue_size) {
+	std::this_thread::sleep_for(thread_sleep_duration);
+      }
+
       for (map<int,Shard>::iterator stripe_it=a_stripe.begin();stripe_it!=a_stripe.end();stripe_it++) {
 	pending_buffers_queue_push(stripe_it->second);
 #ifdef TRACE
@@ -1042,11 +1044,6 @@ void erasureEncodeThread(ErasureCodeBench ecbench) {
 #endif
       encoded.clear();
       a_stripe.clear();
-
-      // Throttle, don't use too many buffers.
-      while (get_pending_buffers_queue_size() > ecbench.queue_size) {
-	std::this_thread::sleep_for(thread_sleep_duration);
-      }
     }
   }
 
